@@ -30,6 +30,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
+from lhotse.cut import MonoCut
 from lhotse.utils import fix_random_seed
 from lhotse.dataset.collation import collate_custom_field
 from torch import Tensor
@@ -63,6 +64,13 @@ def get_parser():
         type=int,
         default=1,
         help="Number of GPUs for DDP training.",
+    )
+
+    parser.add_argument(
+        "--bytes-per-frame",
+        type=int,
+        default=4,
+        help="number of code books",
     )
 
     parser.add_argument(
@@ -410,8 +418,9 @@ def compute_loss(
 
         cuts = batch["supervisions"]["cut"]
         # -100 is identical to ignore_value in CE loss computation.
+        cuts_pre_mixed = [c if isinstance(c, MonoCut) else c.tracks[0].cut for c in cuts]
         codebook_indices, codebook_indices_lens = collate_custom_field(
-            cuts, "codebook_indices", pad_value=-100
+            cuts_pre_mixed, "codebook_indices", pad_value=-100
         )
 
         assert (
@@ -633,6 +642,7 @@ def run(rank, world_size, args):
         num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
+        num_codebooks=params.bytes_per_frame,
     )
 
     checkpoints = load_checkpoint_if_available(params=params, model=model)
@@ -747,7 +757,7 @@ def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
-    args.exp_dir = Path(args.exp_dir)
+    args.exp_dir = Path(f"{args.exp_dir}-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
     args.lang_dir = Path(args.lang_dir)
 
     world_size = args.world_size

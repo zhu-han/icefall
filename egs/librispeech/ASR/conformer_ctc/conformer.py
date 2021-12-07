@@ -79,6 +79,8 @@ class CodeIndicesNet(nn.Module):
         x = self.forward(memory)
         x = x.reshape(-1, self.quantizer_dim)
         target = target.reshape(-1)
+        assert x.shape[0] == target.shape[0], \
+            f"x.shape: {x.shape} while target.shape: {target.shape}"
         ret = self.ce(x, target)
         return ret
 
@@ -115,6 +117,7 @@ class Conformer(Transformer):
         normalize_before: bool = True,
         vgg_frontend: bool = False,
         use_feat_batchnorm: bool = False,
+        num_codebooks: int = 4,
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -150,7 +153,7 @@ class Conformer(Transformer):
             #       and throws an error without this change.
             self.after_norm = identity
 
-        self.cdidxnet = CodeIndicesNet()
+        self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None

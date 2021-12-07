@@ -73,10 +73,18 @@ class LibriSpeechAsrDataModule(DataModule):
             help="When enabled, use 960h LibriSpeech. "
             "Otherwise, use 100h subset.",
         )
+
+        group.add_argument(
+            "--enable-augmentation",
+            type=str2bool,
+            default=True,
+            help="Set to False to disable all augmentaion."
+            "Used when extracting codebook_indexes.",
+        )
         group.add_argument(
             "--feature-dir",
             type=Path,
-            default=Path("data/fbank"),
+            default=Path("data/cdidx_fbank"),
             help="Path to directory with train/valid/test cuts.",
         )
         group.add_argument(
@@ -155,6 +163,7 @@ class LibriSpeechAsrDataModule(DataModule):
         )
 
     def train_dataloaders(self) -> DataLoader:
+        logging.info(f"enable-augmentation: {self.args.enable_augmentation}")
         logging.info("About to get train cuts")
         cuts_train = self.train_cuts()
 
@@ -189,8 +198,8 @@ class LibriSpeechAsrDataModule(DataModule):
         ]
 
         train = K2SpeechRecognitionDataset(
-            cut_transforms=transforms,
-            input_transforms=input_transforms,
+            cut_transforms=transforms if self.args.enable_augmentation else None,
+            input_transforms=input_transforms if self.args.enable_augmentation else None,
             return_cuts=self.args.return_cuts,
         )
 
@@ -206,11 +215,11 @@ class LibriSpeechAsrDataModule(DataModule):
             # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
             # Drop feats to be on the safe side.
             train = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
+                cut_transforms=transforms if self.args.enable_augmentation else None,
                 input_strategy=OnTheFlyFeatures(
                     Fbank(FbankConfig(num_mel_bins=80))
                 ),
-                input_transforms=input_transforms,
+                input_transforms=input_transforms if self.args.enable_augmentation else None,
                 return_cuts=self.args.return_cuts,
             )
 
@@ -222,7 +231,7 @@ class LibriSpeechAsrDataModule(DataModule):
                 shuffle=self.args.shuffle,
                 num_buckets=self.args.num_buckets,
                 bucket_method="equal_duration",
-                drop_last=True,
+                drop_last=True if self.args.enable_augmentation else False,
             )
         else:
             logging.info("Using SingleCutSampler.")
@@ -323,7 +332,7 @@ class LibriSpeechAsrDataModule(DataModule):
     def train_cuts(self) -> CutSet:
         logging.info("About to get train cuts")
         cuts_train = load_manifest(
-            self.args.feature_dir / "cuts_train-clean-100.json.gz"
+            self.args.feature_dir / "cuts_train-clean-100.json"
         )
         if self.args.full_libri:
             cuts_train = (
