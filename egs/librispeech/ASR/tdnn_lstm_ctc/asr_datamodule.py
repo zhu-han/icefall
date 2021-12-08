@@ -109,6 +109,13 @@ class LibriSpeechAsrDataModule(DataModule):
             "(you might want to increase it for larger datasets).",
         )
         group.add_argument(
+            "--time-warp-factor",
+            type=int,
+            default=80,
+            help="Set None or less than 1 to disable"
+            "details in lhotse.lhotse.dataset.signal_transform"
+        )
+        group.add_argument(
             "--concatenate-cuts",
             type=str2bool,
             default=False,
@@ -190,6 +197,7 @@ class LibriSpeechAsrDataModule(DataModule):
 
         input_transforms = [
             SpecAugment(
+                time_warp_factor=self.args.time_warp_factor,
                 num_frame_masks=2,
                 features_mask_size=27,
                 num_feature_masks=2,

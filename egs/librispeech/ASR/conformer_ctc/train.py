@@ -136,7 +136,7 @@ def get_parser():
     parser.add_argument(
         "--codebook-weight",
         type=float,
-        default=0.1,
+        default=0.3,
         help="""The weight of code book loss.
         Note: Currently rate of ctc_loss +  rate of att_loss = 1.0
         codebook_weight is independent with previous two.
@@ -414,7 +414,7 @@ def compute_loss(
             )
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
 
-    if params.codebook_weight != 0.0:
+    if params.codebook_weight > 0.0:
 
         cuts = batch["supervisions"]["cut"]
         # -100 is identical to ignore_value in CE loss computation.
@@ -435,7 +435,8 @@ def compute_loss(
         )
 
         loss += params.codebook_weight * codebook_loss
-    else:
+
+    if params.codebook_weight == 0.0 and params.att_rate == 0.0:
         loss = ctc_loss
         att_loss = torch.tensor([0])
 
@@ -642,6 +643,7 @@ def run(rank, world_size, args):
         num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
+        use_codebook_loss=True if params.codebook_weight > 0.0 else False,
         num_codebooks=params.bytes_per_frame,
     )
 
@@ -757,7 +759,13 @@ def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
-    args.exp_dir = Path(f"{args.exp_dir}-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
+    if args.enable_augmentation:
+        args.exp_dir = Path(f"{args.exp_dir}-time_warp_factor{args.time_warp_factor}-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
+    else:
+        if 0.0 == args.codebook_weight:
+            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-cdweight{args.codebook_weight}")
+        else:
+            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
     args.lang_dir = Path(args.lang_dir)
 
     world_size = args.world_size

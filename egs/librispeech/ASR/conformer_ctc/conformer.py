@@ -117,6 +117,7 @@ class Conformer(Transformer):
         normalize_before: bool = True,
         vgg_frontend: bool = False,
         use_feat_batchnorm: bool = False,
+        use_codebook_loss: bool = False,
         num_codebooks: int = 4,
     ) -> None:
         super(Conformer, self).__init__(
@@ -153,7 +154,8 @@ class Conformer(Transformer):
             #       and throws an error without this change.
             self.after_norm = identity
 
-        self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
+        if use_codebook_loss:
+            self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
