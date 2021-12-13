@@ -19,8 +19,10 @@ import argparse
 import logging
 from pathlib import Path
 from typing import List, Tuple
+from quantization import Quantizer
 
 import k2
+import numpy as np
 import torch
 from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
@@ -39,6 +41,8 @@ from icefall.utils import (
     save_alignments,
     setup_logger,
 )
+
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 
 def get_parser():
@@ -77,17 +81,38 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default="./data/",
+        help="The experiment dir",
+    )
+
+    parser.add_argument(
         "--mem-dir",
-        type=str,
+        type=Path,
         default="conformer_ctc/exp/mem",
         help="The experiment dir",
     )
 
     parser.add_argument(
-        "--num-utts",
+        "--quantizer-id",
+        type=str,
+        default="dd94e38b",
+        help="quantizer_id",
+    )
+
+    parser.add_argument(
+        "--bytes-per-frame",
         type=int,
-        default=1000,
-        help="number of utts to extract memory embeddings",
+        default=4,
+        help="The number of bytes to use to quantize each memory embeddings"
+    )
+
+    parser.add_argument(
+        "--memory-embedding-dim",
+        type=int,
+        default=512,
+        help="dim of memory embeddings to train quantizer"
     )
 
     parser.add_argument(
@@ -96,6 +121,13 @@ def get_parser():
         default=None,
         help="use a pretrained model, e.g. a modle downloaded from model zoo",
     )
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default="wav2vec",
+        help="a short str to introduce which models the embeddings come from"
+    )
+
     return parser
 
 
@@ -117,9 +149,11 @@ def get_params() -> AttributeDict:
     return params
 
 
-def compute_memory(
+def compute_codeindices(
     model: torch.nn.Module,
+    processor: None,
     dl: torch.utils.data.DataLoader,
+    quantizer: None,
     params: AttributeDict,
     writer: None,
 ) -> List[Tuple[str, List[int]]]:
@@ -149,33 +183,44 @@ def compute_memory(
     total_frames = 0
     done_flag = False
     for batch_idx, batch in enumerate(dl):
-        feature = batch["inputs"]
-
-        # at entry, feature is [N, T, C]
-        assert feature.ndim == 3
-        feature = feature.to(device)
+        inputs = processor(batch["inputs"], sampling_rate=16000, return_tensors="pt", padding="longest")
+        feature = inputs["input_values"].squeeze(0)
+        feature = feature.to(model.device)
+        B, T = feature.shape
 
         supervisions = batch["supervisions"]
+        num_samples = supervisions["num_samples"]
+        mask = torch.arange(0,T).expand(B, T) < num_samples.reshape([-1, 1])
+        mask = mask.to(model.device)
+        encoder_memory = model.wav2vec2(feature, mask)[0] # [N, T, C]
+        # encoder_memory = memory_embeddings.to("cpu").numpy()
 
-        _, encoder_memory, memory_mask = model(feature, supervisions)
+        codebook_indices = quantizer.encode(encoder_memory)
 
-        # [T, N, C] --> [N, T, C]
-        encoder_memory = encoder_memory.transpose(0, 1).to("cpu").numpy()
+        # [N, T, C]
+        codebook_indices = codebook_indices.to("cpu").numpy().astype(np.int16)
 
+        # for idx, cut in enumerate(cut_ids):
         cut_list = supervisions["cut"]
-        assert len(cut_list) == encoder_memory.shape[0]
-        assert all(supervisions["start_frame"] == 0)
+        assert len(cut_list) == codebook_indices.shape[0]
+        num_cuts += len(cut_list)
+        assert all(c.start == 0 for c in supervisions['cut'])
         for idx, cut in enumerate(cut_list):
-            num_frames = supervisions["num_frames"][idx]
-            cut.encoder_memory = writer.store_array(
+            num_frames = supervisions["num_samples"][idx] // 320
+            cut.codebook_indices = writer.store_array(
                 key=cut.id,
-                value=encoder_memory[idx][:num_frames],
+                value=codebook_indices[idx][:num_frames],
+                frame_shift=0.02,
+                temporal_dim=0,
+                start=0,
             )
             total_frames += num_frames
 
+
         cuts += cut_list
-        if len(cuts) > params.num_utts:
-            break
+        print(f"processed {total_frames} frames and {num_cuts} cuts; {batch_idx} of {num_batches}")
+        # if len(cuts) > 100:
+        #     break
     return CutSet.from_cuts(cuts)
 
 
@@ -187,6 +232,8 @@ def main():
 
     assert args.return_cuts is True
     assert args.concatenate_cuts is False
+    assert args.quantizer_id is not None
+    assert args.model_id is not None
 
     params = get_params()
     params.update(vars(args))
@@ -201,33 +248,42 @@ def main():
     num_classes = max_token_id + 1  # +1 for the blank
 
 
+    logging.info("About to create model")
+    model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h-lv60-self").to("cuda")
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-960h-lv60-self")
+
+    quantizer_fn = params.mem_dir / f"{params.quantizer_id}-bytes_per_frame_{params.bytes_per_frame}-quantizer.pt"
+
+    quantizer = Quantizer(dim=params.memory_embedding_dim, num_codebooks=args.bytes_per_frame, codebook_size=256)
+    quantizer.load_state_dict(torch.load(quantizer_fn))
+    quantizer = quantizer.to("cuda")
+
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
 
     params["device"] = device
 
+    model.to(device)
+    model.eval()
 
     librispeech = LibriSpeechAsrDataModule(args)
 
-    test_dl = librispeech.test_dataloaders()  # a list
+    train_dl = librispeech.train_dataloaders()
 
-    mem_dir = Path(params.mem_dir)
-    mem_dir.mkdir(exist_ok=True)
+    cdidx_dir = Path(params.data_dir) / f"{args.model_id}-{args.quantizer_id}-bytes_per_frame-{args.bytes_per_frame}"
+    cdidx_dir.mkdir(exist_ok=True)
 
-    enabled_datasets = {
-        "test_clean": test_dl[0],
-    }
-
-    with NumpyHdf5Writer(mem_dir / "memory_embeddings") as writer:
-        for name, dl in enabled_datasets.items():
-            cut_set = compute_memory(
-                model=None,
-                dl=dl,
-                params=params,
-                writer=writer,
-            )
-            cut_set.to_json(mem_dir / "memory_manifest.json")
+    with NumpyHdf5Writer(cdidx_dir / "cdidx_train-clean-100") as writer:
+        cut_set = compute_codeindices(
+            model=model,
+            processor=processor,
+            dl=train_dl,
+            quantizer=quantizer,
+            params=params,
+            writer=writer,
+        )
+        cut_set.to_json(cdidx_dir / "cuts_train-clean-100.json")
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)

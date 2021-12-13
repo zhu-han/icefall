@@ -88,14 +88,14 @@ def get_parser():
     parser.add_argument(
         "--quantizer_id",
         type=str,
-        default=None,
+        default=dd94e38b,
         help="quantizer_id",
     )
 
     parser.add_argument(
         "--bytes-per-frame",
         type=int,
-        default=16,
+        default=4,
         help="The number of bytes to use to quantize each memory embeddings"
     )
 

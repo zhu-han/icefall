@@ -40,6 +40,8 @@ from icefall.utils import (
     setup_logger,
 )
 
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -119,6 +121,7 @@ def get_params() -> AttributeDict:
 
 def compute_memory(
     model: torch.nn.Module,
+    processor: None,
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     writer: None,
@@ -149,24 +152,26 @@ def compute_memory(
     total_frames = 0
     done_flag = False
     for batch_idx, batch in enumerate(dl):
-        feature = batch["inputs"]
+        inputs = processor(batch["inputs"], sampling_rate=16000, return_tensors="pt", padding="longest")
+        feature = inputs["input_values"].squeeze(0)
+        feature = feature.to(model.device)
+        B, T = feature.shape
 
-        # at entry, feature is [N, T, C]
-        assert feature.ndim == 3
-        feature = feature.to(device)
 
         supervisions = batch["supervisions"]
+        num_samples = supervisions["num_samples"]
+        mask = torch.arange(0,T).expand(B, T) < num_samples.reshape([-1, 1])
+        mask = mask.to(model.device)
+        memory_embeddings = model.wav2vec2(feature, mask)[0] # [N, T, C]
 
-        _, encoder_memory, memory_mask = model(feature, supervisions)
-
-        # [T, N, C] --> [N, T, C]
-        encoder_memory = encoder_memory.transpose(0, 1).to("cpu").numpy()
+        encoder_memory = memory_embeddings.to("cpu").numpy()
 
         cut_list = supervisions["cut"]
         assert len(cut_list) == encoder_memory.shape[0]
-        assert all(supervisions["start_frame"] == 0)
+        assert all(c.start == 0 for c in supervisions['cut'])
+
         for idx, cut in enumerate(cut_list):
-            num_frames = supervisions["num_frames"][idx]
+            num_frames = supervisions["num_samples"][idx] // 320
             cut.encoder_memory = writer.store_array(
                 key=cut.id,
                 value=encoder_memory[idx][:num_frames],
@@ -174,6 +179,7 @@ def compute_memory(
             total_frames += num_frames
 
         cuts += cut_list
+        print(len(cuts), flush=True)
         if len(cuts) > params.num_utts:
             break
     return CutSet.from_cuts(cuts)
@@ -201,12 +207,18 @@ def main():
     num_classes = max_token_id + 1  # +1 for the blank
 
 
+    logging.info("About to create model")
+
+    model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h-lv60-self").to("cuda")
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-960h-lv60-self")
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
 
     params["device"] = device
 
+    model.to(device)
+    model.eval()
 
     librispeech = LibriSpeechAsrDataModule(args)
 
@@ -222,7 +234,8 @@ def main():
     with NumpyHdf5Writer(mem_dir / "memory_embeddings") as writer:
         for name, dl in enabled_datasets.items():
             cut_set = compute_memory(
-                model=None,
+                model=model,
+                processor=processor,
                 dl=dl,
                 params=params,
                 writer=writer,

@@ -88,6 +88,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--predictor",
+        type=str,
+        default=None,
+        help="simple_linear predictor ckpnt_predictor",
+    )
+
+    parser.add_argument(
         "--num-epochs",
         type=int,
         default=78,
@@ -414,7 +421,7 @@ def compute_loss(
             )
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
 
-    if params.codebook_weight > 0.0:
+    if params.codebook_weight > 0.0 and is_training:
 
         cuts = batch["supervisions"]["cut"]
         # -100 is identical to ignore_value in CE loss computation.
@@ -423,16 +430,30 @@ def compute_loss(
             cuts_pre_mixed, "codebook_indices", pad_value=-100
         )
 
+        # import pdb; pdb.set_trace()
         assert (
             codebook_indices.shape[0] == encoder_memory.shape[1]
         )  # N: batch_size
+
+        # T: num frames
+        T = encoder_memory.shape[0]
         assert (
-            codebook_indices.shape[1] == encoder_memory.shape[0]
-        )  # T: num frames
+            codebook_indices.shape[1] >= T * 2
+        )  # frame rate of wav2vec codebooks_indices is 50 while for conformer is 25
+        codebook_indices = codebook_indices[:, 0:T * 2: 2, :]
+        encoder_memory = encoder_memory.transpose(0, 1)  # T, N, C --> N, T, C
         codebook_indices = codebook_indices.to(encoder_memory.device).long()
-        codebook_loss = mmodel.cdidxnet.loss(
-            encoder_memory, target=codebook_indices
-        )
+        # codebook_loss = mmodel.cdidxnet.loss(
+        # import pdb; pdb.set_trace()
+        if params.predictor == "ckpnt_predictor":
+            codebook_loss = mmodel.cdidxnet(
+                encoder_memory, codebook_indices
+            )
+        else:
+            total_logprob, _ = mmodel.cdidxnet(
+                encoder_memory, codebook_indices
+            )
+            codebook_loss = -total_logprob
 
         loss += params.codebook_weight * codebook_loss
 
@@ -448,7 +469,7 @@ def compute_loss(
     if params.att_rate != 0.0:
         info["att_loss"] = att_loss.detach().cpu().item()
 
-    if params.codebook_weight != 0.0:
+    if params.codebook_weight > 0.0 and is_training:
         info["codebook_loss"] = codebook_loss.detach().cpu().item()
 
     info["loss"] = loss.detach().cpu().item()
@@ -645,6 +666,7 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_codebook_loss=True if params.codebook_weight > 0.0 else False,
         num_codebooks=params.bytes_per_frame,
+        predictor=params.predictor,
     )
 
     checkpoints = load_checkpoint_if_available(params=params, model=model)
@@ -760,12 +782,12 @@ def main():
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     if args.enable_augmentation:
-        args.exp_dir = Path(f"{args.exp_dir}-time_warp_factor{args.time_warp_factor}-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
+        args.exp_dir = Path(f"{args.exp_dir}-time_warp_factor{args.time_warp_factor}-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}-predictor{args.predictor}")
     else:
         if 0.0 == args.codebook_weight:
-            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-cdweight{args.codebook_weight}")
+            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-cdweight{args.codebook_weight}-predictor{args.predictor}")
         else:
-            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}")
+            args.exp_dir = Path(f"{args.exp_dir}-disable_augmentation-bytes_per_frame{args.bytes_per_frame}-cdweight{args.codebook_weight}-predictor{args.predictor}")
     args.lang_dir = Path(args.lang_dir)
 
     world_size = args.world_size

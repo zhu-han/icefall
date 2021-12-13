@@ -31,7 +31,7 @@ from lhotse.dataset import (
     SingleCutSampler,
     SpecAugment,
 )
-from lhotse.dataset.input_strategies import OnTheFlyFeatures
+from lhotse.dataset.input_strategies import AudioSamples, OnTheFlyFeatures
 from torch.utils.data import DataLoader
 
 from icefall.dataset.datamodule import DataModule
@@ -84,7 +84,7 @@ class LibriSpeechAsrDataModule(DataModule):
         group.add_argument(
             "--feature-dir",
             type=Path,
-            default=Path("data/cdidx_fbank"),
+            default=Path("data/fbank"),
             help="Path to directory with train/valid/test cuts.",
         )
         group.add_argument(
@@ -206,6 +206,7 @@ class LibriSpeechAsrDataModule(DataModule):
         ]
 
         train = K2SpeechRecognitionDataset(
+            # input_strategy=AudioSamples(),
             cut_transforms=transforms if self.args.enable_augmentation else None,
             input_transforms=input_transforms if self.args.enable_augmentation else None,
             return_cuts=self.args.return_cuts,
@@ -312,16 +313,20 @@ class LibriSpeechAsrDataModule(DataModule):
         for cuts_test in cuts:
             logging.debug("About to create test dataset")
             test = K2SpeechRecognitionDataset(
-                input_strategy=OnTheFlyFeatures(
-                    Fbank(FbankConfig(num_mel_bins=80))
-                )
-                if self.args.on_the_fly_feats
-                else PrecomputedFeatures(),
+                # input_strategy=AudioSamples(),
+                # input_strategy=OnTheFlyFeatures(
+                #     Fbank(FbankConfig(num_mel_bins=80))
+                # )
+                # if self.args.on_the_fly_feats
+                # else PrecomputedFeatures(),
                 return_cuts=self.args.return_cuts,
             )
             sampler = BucketingSampler(
                 cuts_test, max_duration=self.args.max_duration, shuffle=False
             )
+            # sampler = SingleCutSampler(
+            #     cuts_test, max_duration=self.args.max_duration, shuffle=False
+            # )
             logging.debug("About to create test dataloader")
             test_dl = DataLoader(
                 test,

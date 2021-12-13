@@ -23,6 +23,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
+from prediction import JointCodebookPredictor
+from ckpnt_prediction import JointCodebookLoss
 
 
 class CodeIndicesNet(nn.Module):
@@ -51,18 +53,7 @@ class CodeIndicesNet(nn.Module):
         self.num_codebooks = num_codebooks
         self.quantizer_dim = quantizer_dim
 
-    def forward(self, memory):
-        """
-        Args:
-        memory:
-            memory embeddings, with shape[T, N, C]
-        output:
-            shape [N, T, num_codebooks*quantizer_dim]
-        """
-        x = self.linear1(memory)
-        return x
-
-    def loss(self, memory: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, memory: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
         memory:
@@ -76,13 +67,13 @@ class CodeIndicesNet(nn.Module):
         """
 
         memory = memory.transpose(0, 1)  # T, N, C --> N, T, C
-        x = self.forward(memory)
+        x = self.linear1(memory)
         x = x.reshape(-1, self.quantizer_dim)
         target = target.reshape(-1)
         assert x.shape[0] == target.shape[0], \
             f"x.shape: {x.shape} while target.shape: {target.shape}"
         ret = self.ce(x, target)
-        return ret
+        return -ret, None
 
 
 class Conformer(Transformer):
@@ -119,6 +110,7 @@ class Conformer(Transformer):
         use_feat_batchnorm: bool = False,
         use_codebook_loss: bool = False,
         num_codebooks: int = 4,
+        predictor: str = "predictor", # "simple_linear", "predictor", "ckpnt_predictor"
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -155,7 +147,12 @@ class Conformer(Transformer):
             self.after_norm = identity
 
         if use_codebook_loss:
-            self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
+            if predictor == "predictor":
+                self.cdidxnet = JointCodebookPredictor(predictor_dim=512, num_codebooks=num_codebooks)
+            elif predictor == "ckpnt_predictor":
+                self.cdidxnet = JointCodebookLoss(predictor_channels=512, num_codebooks=num_codebooks)
+            elif predictor == "simple_linear":
+                self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None

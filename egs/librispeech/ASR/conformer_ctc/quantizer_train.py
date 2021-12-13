@@ -16,6 +16,8 @@
 # limitations under the License.
 
 import argparse
+from pathlib import Path
+
 from lhotse import CutSet, load_manifest
 from lhotse.dataset import (
     BucketingSampler,
@@ -39,7 +41,7 @@ def get_parser():
     parser.add_argument(
         "--bytes-per-frame",
         type=int,
-        default=16,
+        default=4,
         help="The number of bytes to use to quantize each memory embeddings"
              "Usually, it's equal to number codebooks",
     )
@@ -47,7 +49,7 @@ def get_parser():
     parser.add_argument(
         "--memory-embedding-dim",
         type=int,
-        default=512,
+        default=1024,
         help="dim of memory embeddings to train quantizer"
     )
 
@@ -63,7 +65,7 @@ def get_parser():
 def initialize_memory_dataloader(mem_dir: Path = None):
     cuts = load_manifest(mem_dir / "memory_manifest.json")
     dataset = K2SpeechRecognitionDataset(return_cuts=True)
-    max_duration=20
+    max_duration=1
     sampler = BucketingSampler(
         cuts, max_duration=max_duration, shuffle=False,
     )
@@ -99,7 +101,7 @@ def main():
             break
         else:
             epoch += 1
-            dl = initialize_memory_dataloader()
+            dl = initialize_memory_dataloader(args.mem_dir)
     quantizer = trainer.get_quantizer()
     quantizer_fn = quantizer.get_id() + f"-bytes_per_frame_{args.bytes_per_frame}-quantizer.pt"
     quantizer_fn = args.mem_dir / quantizer_fn
