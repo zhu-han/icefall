@@ -28,6 +28,7 @@ import k2
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
 from lhotse.utils import fix_random_seed
@@ -50,6 +51,9 @@ from icefall.utils import (
     setup_logger,
     str2bool,
 )
+import copy
+import collections
+import math
 
 
 def get_parser():
@@ -98,7 +102,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="conformer_ctc/exp",
+        default="conformer_ctc/exp_semi",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -112,6 +116,30 @@ def get_parser():
         help="""The lang dir
         It contains language related input files such as
         "lexicon.txt"
+        """,
+    )
+
+    parser.add_argument(
+        "--consistency-weight",
+        type=float,
+        default=0.0,
+        help="""Weight of the consistency loss"
+        """,
+    )
+
+    parser.add_argument(
+        "--consistency-level",
+        type=str,
+        default="logit",
+        help="""Level of the consistency loss"
+        """,
+    )
+
+    parser.add_argument(
+        "--ema-decay-factor",
+        type=float,
+        default=0.99989,
+        help="""decay factor for exponential moving average of the teacher model (0.0 is always use current model)"
         """,
     )
 
@@ -171,11 +199,6 @@ def get_params() -> AttributeDict:
 
         - use_double_scores: It is used in k2.ctc_loss
 
-        - weight_decay:  The weight_decay for the optimizer.
-
-        - lr_factor: The lr_factor for Noam optimizer.
-
-        - warm_step: The warm_step for Noam optimizer.
     """
     params = AttributeDict(
         {
@@ -198,12 +221,9 @@ def get_params() -> AttributeDict:
             "beam_size": 10,
             "reduction": "sum",
             "use_double_scores": True,
-            "att_rate": 0.7,
-            # parameters for Noam
-            "weight_decay": 1e-6,
-            "lr_factor": 5.0,
-            "warm_step": 25000,
+            "att_rate": 0.0,
             "env_info": get_env_info(),
+            "pretrain": "conformer_ctc/exp/model.pt"
         }
     )
 
@@ -261,9 +281,33 @@ def load_checkpoint_if_available(
     return saved_params
 
 
+def load_pretrain_if_available(
+    params: AttributeDict,
+    model: nn.Module,
+) -> None:
+    """Load pre-trained model parameter from file.
+
+    Args:
+      params:
+        The return value of :func:`get_params`.
+      model:
+        The training model.
+    Returns:
+      Return None.
+    """
+    if params.pretrain is None:
+        return
+
+    _ = load_checkpoint(
+        params.pretrain ,
+        model=model,
+    )
+
+
 def save_checkpoint(
     params: AttributeDict,
     model: nn.Module,
+    teacher_model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     rank: int = 0,
@@ -288,6 +332,12 @@ def save_checkpoint(
         rank=rank,
     )
 
+    save_checkpoint_impl(
+        filename=params.exp_dir / f"teacher-epoch-{params.cur_epoch}.pt",
+        model=teacher_model,
+        rank=rank,
+    )
+
     if params.best_train_epoch == params.cur_epoch:
         best_train_filename = params.exp_dir / "best-train-loss.pt"
         copyfile(src=filename, dst=best_train_filename)
@@ -295,6 +345,211 @@ def save_checkpoint(
     if params.best_valid_epoch == params.cur_epoch:
         best_valid_filename = params.exp_dir / "best-valid-loss.pt"
         copyfile(src=filename, dst=best_valid_filename)
+
+
+def pseudo_label(lprobs, supervision_segments):
+    ctc_targets = list()
+    indices = supervision_segments[:, 0]
+    input_lengths = supervision_segments[:, 2]
+    for i, indice in enumerate(indices):
+        lprob = lprobs[indice][:input_lengths[i]]
+        _, max_toks = lprob.max(dim=-1)
+        toks = max_toks.unique_consecutive()
+        pred_units_arr = toks[toks != 0]
+        ctc_targets.append(pred_units_arr.tolist())
+
+    return ctc_targets
+
+
+def pseudo_label_sample(lprobs, supervision_segments):
+    ctc_targets = list()
+    indices = supervision_segments[:, 0]
+    input_lengths = supervision_segments[:, 2]
+    for i, indice in enumerate(indices):
+        prob = lprobs[indice][:input_lengths[i]].exp()
+        sampler = torch.distributions.categorical.Categorical(prob)
+        max_toks = sampler.sample()
+        toks = max_toks.unique_consecutive()
+        pred_units_arr = toks[toks != 0]
+        ctc_targets.append(pred_units_arr.tolist())
+
+    return ctc_targets
+
+
+def SoftNLLLoss(
+    log_probs, targets, mask
+):
+    """
+    negative log likelihood loss using soft labels.
+
+    Args:
+    log_probs : The predicted log-probs. Its shape is [batch, frames, p]
+    targets : The target probabilities. Its shape is [batch, frames, p]
+    mask : Padding mask, where the padding indices are True. Its shape is [batch, frames]
+    """
+    # Getting the number of sentences in the minibatch
+    batch_size = log_probs.shape[0]
+
+    # Getting the maximum length of label sequence
+    max_len = log_probs.shape[1]
+
+    # Reshape to [batch_size * length, feature]
+    log_probs = log_probs.reshape(batch_size * max_len, log_probs.shape[-1])
+
+    # Reshape to [batch_size * length, feature]
+    targets = targets.reshape(batch_size * max_len, targets.shape[-1])
+
+    loss = (-targets * log_probs).sum(1)
+    # Loss averaging
+    loss = torch.sum(loss.reshape(batch_size, max_len) * ~mask) 
+    return loss
+
+
+def EMA(new_model, last_model, decay_factor):
+    model_params_keys = list(new_model.keys())
+    params_keys = list(last_model.keys())
+    if params_keys != model_params_keys:
+        raise KeyError(
+            "expected list of params: {}, "
+            "but found: {}".format(params_keys, model_params_keys)
+        )
+
+    latest_model = collections.OrderedDict()
+
+    for k in params_keys:
+        p_new = new_model[k].float()
+        p_last = last_model[k].float()
+        latest_model[k] = decay_factor * p_last + (1 - decay_factor) * p_new
+    return latest_model
+
+
+def compute_semi_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    teacher_model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute CTC loss given the model and its inputs.
+
+    Args:
+      params:
+        Parameters for training. See :func:`get_params`.
+      model:
+        The model for training. It is an instance of Conformer in our case.
+      batch:
+        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
+        for the content in it.
+      graph_compiler:
+        It is used to build a decoding graph from a ctc topo and training
+        transcript. The training transcript is contained in the given `batch`,
+        while the ctc topo is built when this compiler is instantiated.
+      is_training:
+        True for training. False for validation. When it is True, this
+        function enables autograd during computation; when it is False, it
+        disables autograd.
+    """
+    device = graph_compiler.device
+    
+    supervisions = batch["supervisions"]
+    # triple_feature = batch["inputs"]
+    triple_feature = [batch["inputs_raw"], batch["inputs"], batch["inputs_copy"]]
+    assert len(triple_feature) == 3
+    feature = triple_feature[0]
+    # at entry, feature is (N, T, C)
+    assert feature.ndim == 3
+    feature = feature.to(device)
+
+    supervision_segments, texts = encode_supervisions(
+        supervisions, subsampling_factor=params.subsampling_factor
+    )
+
+    teacher_model_state_dict = EMA(model.state_dict(), teacher_model.state_dict(), params.ema_decay_factor)
+    teacher_model.load_state_dict(teacher_model_state_dict)
+    teacher_model.eval()
+
+    with torch.no_grad():
+        infer_nnet_output, _, _ = teacher_model(feature, supervisions)
+        # nnet_output is (N, T, C)
+
+        # NOTE: We need `encode_supervisions` to sort sequences with
+        # different duration in decreasing order, required by
+        # `k2.intersect_dense` called in `k2.ctc_loss`
+
+        pseudo_token_ids = pseudo_label(infer_nnet_output, supervision_segments)
+    del infer_nnet_output
+
+    token_ids = graph_compiler.texts_to_ids(texts)
+    for i in range(len(token_ids)):
+        if len(token_ids[i]) == 0:
+            token_ids[i] = pseudo_token_ids[i]
+
+    decoding_graph = graph_compiler.compile(token_ids)
+
+    model.train()
+    nnet_output_1, feature_1, feature_mask_1 = model(triple_feature[1].to(device), supervisions)
+    if params.consistency_level == "feature":
+        feature_1 = feature_1.transpose(0,1)[feature_mask_1]
+
+    dense_fsa_vec_1 = k2.DenseFsaVec(
+        nnet_output_1,
+        supervision_segments,
+        allow_truncate=params.subsampling_factor - 1,
+    )
+
+    
+    nnet_output_2, feature_2, feature_mask_2 = model(triple_feature[2].to(device), supervisions)
+    if params.consistency_level == "feature":
+        feature_2 = feature_2.transpose(0,1)[feature_mask_2]
+
+    assert feature_mask_1.equal(feature_mask_2)
+
+    dense_fsa_vec_2 = k2.DenseFsaVec(
+        nnet_output_2,
+        supervision_segments,
+        allow_truncate=params.subsampling_factor - 1,
+    )
+
+    ctc_loss = 1/2 * ( k2.ctc_loss(
+        decoding_graph=decoding_graph,
+        dense_fsa_vec=dense_fsa_vec_1,
+        output_beam=params.beam_size,
+        reduction=params.reduction,
+        use_double_scores=params.use_double_scores,
+    ) + k2.ctc_loss(
+        decoding_graph=decoding_graph,
+        dense_fsa_vec=dense_fsa_vec_2,
+        output_beam=params.beam_size,
+        reduction=params.reduction,
+        use_double_scores=params.use_double_scores,
+    ))
+
+    if params.consistency_weight != 0.0:
+        if params.consistency_level == "logit":
+            consistency_loss = 1/2 * (SoftNLLLoss(nnet_output_1, nnet_output_2.exp(), feature_mask_1) + SoftNLLLoss(nnet_output_2, nnet_output_1.exp(), feature_mask_1))
+        elif params.consistency_level == "feature":
+            # consistency_loss = F.mse_loss(feature_1, feature_2, reduction='sum') - F.cosine_similarity(feature_1, feature_2, -1, 1e-6).sum()
+            consistency_loss = - F.cosine_similarity(feature_1, feature_2, -1, 1e-6).sum()
+        else:
+            raise NotImplementedError()
+    else:
+        consistency_loss = torch.zeros((1), device=nnet_output_1.device)
+
+    assert params.att_rate == 0.0
+
+    loss = ctc_loss + params.consistency_weight * consistency_loss
+    assert loss.requires_grad == is_training
+
+    info = MetricsTracker()
+    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["consistency_loss"] = consistency_loss.detach().cpu().item()
+
+    info["loss"] = loss.detach().cpu().item()
+
+    return loss, info
 
 
 def compute_loss(
@@ -433,6 +688,7 @@ def compute_validation_loss(
 def train_one_epoch(
     params: AttributeDict,
     model: nn.Module,
+    teacher_model: nn.Module,
     optimizer: torch.optim.Optimizer,
     graph_compiler: BpeCtcTrainingGraphCompiler,
     train_dl: torch.utils.data.DataLoader,
@@ -472,9 +728,10 @@ def train_one_epoch(
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
-        loss, loss_info = compute_loss(
+        loss, loss_info = compute_semi_loss(
             params=params,
             model=model,
+            teacher_model=teacher_model,
             batch=batch,
             graph_compiler=graph_compiler,
             is_training=True,
@@ -585,29 +842,30 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
 
+    load_pretrain_if_available(params=params, model=model)
+
     checkpoints = load_checkpoint_if_available(params=params, model=model)
 
     model.to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    teacher_model = copy.deepcopy(model)
 
-    optimizer = Noam(
-        model.parameters(),
-        model_size=params.attention_dim,
-        factor=params.lr_factor,
-        warm_step=params.warm_step,
-        weight_decay=params.weight_decay,
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=0.001, betas=(0.9, 0.98), eps=1e-9
     )
 
     if checkpoints:
         optimizer.load_state_dict(checkpoints["optimizer"])
 
     librispeech = LibriSpeechAsrDataModule(args)
-    train_dl = librispeech.train_dataloaders()
+    train_dl = librispeech.train_semi_dataloaders()
     valid_dl = librispeech.valid_dataloaders()
 
     scan_pessimistic_batches_for_oom(
         model=model,
+        teacher_model=teacher_model,
         train_dl=train_dl,
         optimizer=optimizer,
         graph_compiler=graph_compiler,
@@ -617,7 +875,7 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs):
         train_dl.sampler.set_epoch(epoch)
 
-        cur_lr = optimizer._rate
+        cur_lr = optimizer.param_groups[0]['lr']
         if tb_writer is not None:
             tb_writer.add_scalar(
                 "train/learning_rate", cur_lr, params.batch_idx_train
@@ -632,6 +890,7 @@ def run(rank, world_size, args):
         train_one_epoch(
             params=params,
             model=model,
+            teacher_model=teacher_model,
             optimizer=optimizer,
             graph_compiler=graph_compiler,
             train_dl=train_dl,
@@ -643,6 +902,7 @@ def run(rank, world_size, args):
         save_checkpoint(
             params=params,
             model=model,
+            teacher_model=teacher_model,
             optimizer=optimizer,
             rank=rank,
         )
@@ -656,6 +916,7 @@ def run(rank, world_size, args):
 
 def scan_pessimistic_batches_for_oom(
     model: nn.Module,
+    teacher_model: nn.Module,
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     graph_compiler: BpeCtcTrainingGraphCompiler,
@@ -671,9 +932,10 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             optimizer.zero_grad()
-            loss, _ = compute_loss(
+            loss, _ = compute_semi_loss(
                 params=params,
                 model=model,
+                teacher_model=teacher_model,
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=True,

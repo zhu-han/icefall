@@ -26,11 +26,11 @@ from lhotse.dataset import (
     BucketingSampler,
     CutConcatenate,
     CutMix,
-    K2SpeechRecognitionDataset,
     PrecomputedFeatures,
     SingleCutSampler,
     SpecAugment,
 )
+from icefall.dataset.dataset import K2SpeechRecognitionDataset
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
 from torch.utils.data import DataLoader
 
@@ -272,6 +272,7 @@ class LibriSpeechAsrDataModule(DataModule):
         valid_sampler = BucketingSampler(
             cuts_valid,
             max_duration=self.args.max_duration,
+            num_buckets=8,
             shuffle=False,
         )
         logging.info("About to create dev dataloader")
@@ -286,7 +287,10 @@ class LibriSpeechAsrDataModule(DataModule):
         return valid_dl
 
     def test_dataloaders(self) -> Union[DataLoader, List[DataLoader]]:
+        logging.info("About to get test cuts")
         cuts = self.test_cuts()
+
+        logging.info("About to create train dataset")
         is_list = isinstance(cuts, list)
         test_loaders = []
         if not is_list:
@@ -357,3 +361,168 @@ class LibriSpeechAsrDataModule(DataModule):
                 )
             )
         return cuts
+
+
+    @lru_cache()
+    def valid_tedlium_cuts(self) -> CutSet:
+        logging.info("About to get dev cuts")
+        cuts_valid = load_manifest(self.args.feature_dir / "cuts_dev.json.gz")
+        return cuts_valid
+
+    @lru_cache()
+    def test_tedlium_cuts(self) -> List[CutSet]:
+        test_sets = ["dev", "test"]
+        cuts = []
+        for test_set in test_sets:
+            logging.debug("About to get test cuts")
+            cuts.append(
+                load_manifest(
+                    self.args.feature_dir / f"cuts_{test_set}.json.gz"
+                )
+            )
+        return cuts
+
+    def train_semi_dataloaders(self) -> DataLoader:
+        logging.info("About to get train cuts")
+        cuts_train = self.train_semi_cuts()
+
+        logging.info("About to get Musan cuts")
+        cuts_musan = load_manifest(self.args.feature_dir / "cuts_musan.json.gz")
+
+        logging.info("About to create train dataset")
+        transforms = [
+            CutMix(cuts=cuts_musan, prob=1.0, snr=(10, 20), preserve_id=True)
+        ]
+        if self.args.concatenate_cuts:
+            logging.info(
+                f"Using cut concatenation with duration factor "
+                f"{self.args.duration_factor} and gap {self.args.gap}."
+            )
+            # Cut concatenation should be the first transform in the list,
+            # so that if we e.g. mix noise in, it will fill the gaps between
+            # different utterances.
+            transforms = [
+                CutConcatenate(
+                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                )
+            ] + transforms
+
+        input_transforms = [
+            SpecAugment(
+                time_warp_factor=None,
+                num_frame_masks=2,
+                features_mask_size=27,
+                num_feature_masks=2,
+                frames_mask_size=100,
+                p=1.0
+            )
+        ]
+
+        train = K2SpeechRecognitionDataset(
+            cut_transforms=transforms,
+            input_transforms=input_transforms,
+            return_cuts=self.args.return_cuts,
+        )
+
+        if self.args.on_the_fly_feats:
+            # NOTE: the PerturbSpeed transform should be added only if we
+            # remove it from data prep stage.
+            # Add on-the-fly speed perturbation; since originally it would
+            # have increased epoch size by 3, we will apply prob 2/3 and use
+            # 3x more epochs.
+            # Speed perturbation probably should come first before
+            # concatenation, but in principle the transforms order doesn't have
+            # to be strict (e.g. could be randomized)
+            # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
+            # Drop feats to be on the safe side.
+            train = K2SpeechRecognitionDataset(
+                cut_transforms=transforms,
+                input_strategy=OnTheFlyFeatures(
+                    Fbank(FbankConfig(num_mel_bins=80))
+                ),
+                input_transforms=input_transforms,
+                return_cuts=self.args.return_cuts,
+            )
+
+        if self.args.bucketing_sampler:
+            logging.info("Using BucketingSampler.")
+            train_sampler = BucketingSampler(
+                cuts_train,
+                max_duration=self.args.max_duration,
+                shuffle=self.args.shuffle,
+                num_buckets=self.args.num_buckets,
+                bucket_method="equal_duration",
+                drop_last=True,
+            )
+        else:
+            logging.info("Using SingleCutSampler.")
+            train_sampler = SingleCutSampler(
+                cuts_train,
+                max_duration=self.args.max_duration,
+                shuffle=self.args.shuffle,
+            )
+        logging.info("About to create train dataloader")
+
+        train_dl = DataLoader(
+            train,
+            sampler=train_sampler,
+            batch_size=None,
+            num_workers=self.args.num_workers,
+            persistent_workers=False,
+        )
+
+        return train_dl
+
+
+    @lru_cache()
+    def train_semi_cuts(self) -> CutSet:
+        logging.info("About to get train cuts")
+        cuts_train = load_manifest(
+            self.args.feature_dir / "cuts_train-clean-100.json.gz"
+        )
+        if self.args.full_libri:
+            cuts_train = (
+                cuts_train
+                + load_manifest(
+                    self.args.feature_dir / "cuts_train-clean-360-unlabel.json.gz"
+                )
+                + load_manifest(
+                   self.args.feature_dir / "cuts_train-other-500-unlabel.json.gz"
+                )
+            )
+        else:
+            cuts_train = (
+                cuts_train
+                + load_manifest(
+                    self.args.feature_dir / "cuts_train-clean-360-unlabel.json.gz"
+                )
+            )   
+        return cuts_train
+
+    @lru_cache()
+    def train_tedlium_semi_cuts(self) -> CutSet:
+        logging.info("About to get train cuts")
+        cuts_train = load_manifest(
+            self.args.feature_dir / "cuts_train-clean-100.json.gz"
+        )
+        cuts_train = (
+            cuts_train
+            + load_manifest(
+                self.args.feature_dir / "cuts_train-unlabel.json.gz"
+            )
+        )   
+        return cuts_train
+
+    @lru_cache()
+    def train_tedlium_supervised_cuts(self) -> CutSet:
+        logging.info("About to get train cuts")
+        cuts_train = load_manifest(
+            self.args.feature_dir / "cuts_train-clean-100.json.gz"
+        )
+        cuts_train = (
+            cuts_train
+            + load_manifest(
+                self.args.feature_dir / "cuts_train.json.gz"
+            )
+        )   
+        return cuts_train

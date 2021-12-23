@@ -143,7 +143,7 @@ def get_parser():
     parser.add_argument(
         "--lang-dir",
         type=str,
-        default="data/lang_bpe_5000",
+        default="data/lang_bpe_1000",
         help="The lang dir",
     )
 
@@ -159,8 +159,8 @@ def get_params() -> AttributeDict:
             "vgg_frontend": False,
             "use_feat_batchnorm": True,
             "feature_dim": 80,
-            "nhead": 8,
-            "attention_dim": 512,
+            "nhead": 4,
+            "attention_dim": 256,
             "num_decoder_layers": 6,
             # parameters for decoding
             "search_beam": 20,
@@ -263,6 +263,31 @@ def decode_one_batch(
         assert HLG is None
         assert bpe_model is not None
         decoding_graph = H
+
+    if params.method == "greedy-decoding":
+
+        def pseudo_label(lprobs, supervision_segments):
+            ctc_targets = list()
+            indices = supervision_segments[:, 0]
+            input_lengths = supervision_segments[:, 2]
+            for i, indice in enumerate(indices):
+                lprob = lprobs[indice][:input_lengths[i]]
+                _, max_toks = lprob.max(dim=-1)
+                toks = max_toks.unique_consecutive()
+                pred_units_arr = toks[toks != 0]
+                ctc_targets.append(pred_units_arr.tolist())
+
+            return ctc_targets
+            
+        token_ids = pseudo_label(nnet_output, supervision_segments)
+
+        # hyps is a list of str, e.g., ['xxx yyy zzz', ...]
+        hyps = bpe_model.decode(token_ids)
+
+        # hyps is a list of list of str, e.g., [['xxx', 'yyy', 'zzz'], ... ]
+        hyps = [s.split() for s in hyps]
+        key = "greedy-decoding"
+        return {key: hyps}
 
     lattice = get_lattice(
         nnet_output=nnet_output,
