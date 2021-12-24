@@ -73,7 +73,7 @@ class CodeIndicesNet(nn.Module):
         assert x.shape[0] == target.shape[0], \
             f"x.shape: {x.shape} while target.shape: {target.shape}"
         ret = self.ce(x, target)
-        return -ret, None
+        return ret
 
 
 class Conformer(Transformer):
@@ -145,14 +145,17 @@ class Conformer(Transformer):
             # Note: TorchScript detects that self.after_norm could be used inside forward()
             #       and throws an error without this change.
             self.after_norm = identity
+        
+        self.use_codebook_loss = use_codebook_loss
 
         if use_codebook_loss:
             if predictor == "predictor":
-                self.cdidxnet = JointCodebookPredictor(predictor_dim=512, num_codebooks=num_codebooks)
+                self.cdidxnet = JointCodebookPredictor(predictor_dim=d_model, num_codebooks=num_codebooks)
             elif predictor == "ckpnt_predictor":
-                self.cdidxnet = JointCodebookLoss(predictor_channels=512, num_codebooks=num_codebooks)
+                self.cdidxnet = JointCodebookLoss(predictor_channels=d_model, num_codebooks=num_codebooks)
             elif predictor == "simple_linear":
                 self.cdidxnet = CodeIndicesNet(num_codebooks=num_codebooks)
+
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None

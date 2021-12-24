@@ -791,11 +791,12 @@ class Noam(object):
             "optimizer": self.optimizer.state_dict(),
         }
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=True):
         """Load state_dict."""
         for key, value in state_dict.items():
             if key == "optimizer":
-                self.optimizer.load_state_dict(state_dict["optimizer"])
+                if strict:
+                  self.optimizer.load_state_dict(state_dict["optimizer"])
             else:
                 setattr(self, key, value)
 

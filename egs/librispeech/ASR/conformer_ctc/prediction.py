@@ -143,4 +143,4 @@ class JointCodebookPredictor(nn.Module):
         # all be the same), as we want the total number of frames.
         tot_count = codebook_mask.select(dim=-2, index=0).sum()
 
-        return (tot_logprob, tot_count)
+        return -tot_logprob

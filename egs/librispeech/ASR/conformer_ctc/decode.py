@@ -131,7 +131,7 @@ def get_parser():
     parser.add_argument(
         "--lang-dir",
         type=str,
-        default="data/lang_bpe_500",
+        default="data/lang_bpe_1000",
         help="The lang dir",
     )
 
@@ -155,8 +155,8 @@ def get_params() -> AttributeDict:
             "vgg_frontend": False,
             "use_feat_batchnorm": True,
             "feature_dim": 80,
-            "nhead": 8,
-            "attention_dim": 512,
+            "nhead": 4,
+            "attention_dim": 256,
             "num_decoder_layers": 6,
             # parameters for decoding
             "search_beam": 20,
