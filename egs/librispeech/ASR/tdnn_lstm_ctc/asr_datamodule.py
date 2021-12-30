@@ -262,6 +262,99 @@ class LibriSpeechAsrDataModule(DataModule):
         return train_dl
 
 
+    def train_semi_dataloaders(self) -> DataLoader:
+        logging.info(f"enable-augmentation: {self.args.enable_augmentation}")
+        logging.info("About to get train cuts")
+        cuts_train = self.train_semi_cuts()
+
+        logging.info("About to get Musan cuts")
+        cuts_musan = load_manifest(self.args.feature_dir / "cuts_musan.json.gz")
+
+        logging.info("About to create train dataset")
+        transforms = [
+            CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20), preserve_id=True)
+        ]
+        if self.args.concatenate_cuts:
+            logging.info(
+                f"Using cut concatenation with duration factor "
+                f"{self.args.duration_factor} and gap {self.args.gap}."
+            )
+            # Cut concatenation should be the first transform in the list,
+            # so that if we e.g. mix noise in, it will fill the gaps between
+            # different utterances.
+            transforms = [
+                CutConcatenate(
+                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                )
+            ] + transforms
+
+        input_transforms = [
+            SpecAugment(
+                time_warp_factor=self.args.time_warp_factor,
+                num_frame_masks=2,
+                features_mask_size=27,
+                num_feature_masks=2,
+                frames_mask_size=100,
+            )
+        ]
+
+        train = K2SpeechRecognitionDataset(
+            # input_strategy=AudioSamples(),
+            cut_transforms=transforms if self.args.enable_augmentation else None,
+            input_transforms=input_transforms if self.args.enable_augmentation else None,
+            return_cuts=self.args.return_cuts,
+        )
+
+        if self.args.on_the_fly_feats:
+            # NOTE: the PerturbSpeed transform should be added only if we
+            # remove it from data prep stage.
+            # Add on-the-fly speed perturbation; since originally it would
+            # have increased epoch size by 3, we will apply prob 2/3 and use
+            # 3x more epochs.
+            # Speed perturbation probably should come first before
+            # concatenation, but in principle the transforms order doesn't have
+            # to be strict (e.g. could be randomized)
+            # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
+            # Drop feats to be on the safe side.
+            train = K2SpeechRecognitionDataset(
+                cut_transforms=transforms if self.args.enable_augmentation else None,
+                input_strategy=OnTheFlyFeatures(
+                    Fbank(FbankConfig(num_mel_bins=80))
+                ),
+                input_transforms=input_transforms if self.args.enable_augmentation else None,
+                return_cuts=self.args.return_cuts,
+            )
+
+        if self.args.bucketing_sampler:
+            logging.info("Using BucketingSampler.")
+            train_sampler = BucketingSampler(
+                cuts_train,
+                max_duration=self.args.max_duration,
+                shuffle=self.args.shuffle,
+                num_buckets=self.args.num_buckets,
+                bucket_method="equal_duration",
+                drop_last=True if self.args.enable_augmentation else False,
+            )
+        else:
+            logging.info("Using SingleCutSampler.")
+            train_sampler = SingleCutSampler(
+                cuts_train,
+                max_duration=self.args.max_duration,
+                shuffle=self.args.shuffle,
+            )
+        logging.info("About to create train dataloader")
+
+        train_dl = DataLoader(
+            train,
+            sampler=train_sampler,
+            batch_size=None,
+            num_workers=self.args.num_workers,
+            persistent_workers=False,
+        )
+
+        return train_dl
+
+
     def partition_dataloaders(self, partition) -> DataLoader:
         logging.info(f"enable-augmentation: {self.args.enable_augmentation}")
         logging.info(f"About to get {partition} cuts")

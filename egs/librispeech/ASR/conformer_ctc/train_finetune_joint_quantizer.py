@@ -73,7 +73,7 @@ def get_parser():
     parser.add_argument(
         "--bytes-per-frame",
         type=int,
-        default=16,
+        default=4,
         help="number of code books",
     )
 
@@ -147,13 +147,13 @@ def get_parser():
     parser.add_argument(
         "--pretrained-model",
         type=str,
-        default=None,
-        # default="conformer_ctc/exp/model.pt",
+        # default=None,
+        default="conformer_ctc/exp/model.pt",
         help="use a pretrained model, e.g. a modle downloaded from model zoo",
     )
 
     parser.add_argument(
-        "--quantizer",
+        "--use-quantizer",
         type=str2bool,
         default=True,
         help="Should quantizer be used.",
@@ -162,7 +162,7 @@ def get_parser():
     parser.add_argument(
         "--quantizer-weight",
         type=float,
-        default=5.0,
+        default=1.0,
         help="""Weight of the quantizer loss"
         """,
     )
@@ -170,7 +170,7 @@ def get_parser():
     parser.add_argument(
         "--entropy-scale",
         type=float,
-        default=0.01,
+        default=0.1,
         help="""Sclae of the logits_entropy_loss"
         """,
     )
@@ -193,7 +193,7 @@ def get_parser():
     parser.add_argument(
         "--consistency-weight",
         type=float,
-        default=0.2,
+        default=1.0,
         help="""Weight of the consistency loss"
         """,
     )
@@ -218,6 +218,22 @@ def get_parser():
         type=float,
         default=0.99989,
         help="""decay factor for exponential moving average of the teacher model (0.0 is always use current model)"
+        """,
+    )
+
+    parser.add_argument(
+        "--optimizer-type",
+        type=str,
+        default="adam",
+        help="""Optimizer (adam or noam)"
+        """,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.001,
+        help="""Learning rate for Adam optimizer"
         """,
     )
 
@@ -404,35 +420,6 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def pseudo_label(lprobs, supervision_segments):
-    ctc_targets = list()
-    indices = supervision_segments[:, 0]
-    input_lengths = supervision_segments[:, 2]
-    for i, indice in enumerate(indices):
-        lprob = lprobs[indice][:input_lengths[i]]
-        _, max_toks = lprob.max(dim=-1)
-        toks = max_toks.unique_consecutive()
-        pred_units_arr = toks[toks != 0]
-        ctc_targets.append(pred_units_arr.tolist())
-
-    return ctc_targets
-
-
-def pseudo_label_sample(lprobs, supervision_segments):
-    ctc_targets = list()
-    indices = supervision_segments[:, 0]
-    input_lengths = supervision_segments[:, 2]
-    for i, indice in enumerate(indices):
-        prob = lprobs[indice][:input_lengths[i]].exp()
-        sampler = torch.distributions.categorical.Categorical(prob)
-        max_toks = sampler.sample()
-        toks = max_toks.unique_consecutive()
-        pred_units_arr = toks[toks != 0]
-        ctc_targets.append(pred_units_arr.tolist())
-
-    return ctc_targets
-
-
 def SoftNLLLoss(
     log_probs, targets, mask
 ):
@@ -460,24 +447,6 @@ def SoftNLLLoss(
     # Loss averaging
     loss = torch.sum(loss.reshape(batch_size, max_len) * ~mask) 
     return loss
-
-
-def EMA(new_model, last_model, decay_factor):
-    model_params_keys = list(new_model.keys())
-    params_keys = list(last_model.keys())
-    if params_keys != model_params_keys:
-        raise KeyError(
-            "expected list of params: {}, "
-            "but found: {}".format(params_keys, model_params_keys)
-        )
-
-    latest_model = collections.OrderedDict()
-
-    for k in params_keys:
-        p_new = new_model[k].float()
-        p_last = last_model[k].float()
-        latest_model[k] = decay_factor * p_last + (1 - decay_factor) * p_new
-    return latest_model
 
 
 def compute_semi_loss(
@@ -511,104 +480,136 @@ def compute_semi_loss(
     device = graph_compiler.device
     
     supervisions = batch["supervisions"]
-    # triple_feature = batch["inputs"]
+
     triple_feature = [batch["inputs_raw"], batch["inputs"], batch["inputs_copy"]]
     assert len(triple_feature) == 3
-    # at entry, feature is (N, T, C)
+
+    # each feature is (N, T, C)
     assert triple_feature[0].ndim == 3
 
     supervision_segments, texts = encode_supervisions(
         supervisions, subsampling_factor=params.subsampling_factor
     )
 
-    token_ids = graph_compiler.texts_to_ids(texts)
-    
-    if teacher_model is not None:
-        teacher_model_state_dict = EMA(model.state_dict(), teacher_model.state_dict(), params.ema_decay_factor)
-        teacher_model.load_state_dict(teacher_model_state_dict)
-        teacher_model.eval()
-
-        with torch.no_grad():
-            infer_nnet_output, _, _ = teacher_model(triple_feature[0].to(device), supervisions)
-            # nnet_output is (N, T, C)
-
-            # NOTE: We need `encode_supervisions` to sort sequences with
-            # different duration in decreasing order, required by
-            # `k2.intersect_dense` called in `k2.ctc_loss`
-
-            pseudo_token_ids = pseudo_label(infer_nnet_output, supervision_segments)
-            del infer_nnet_output
-
-        for i in range(len(token_ids)):
-            if len(token_ids[i]) == 0:
-                token_ids[i] = pseudo_token_ids[i]
-
-    decoding_graph = graph_compiler.compile(token_ids)
+    # identify labeled and unlabeled ids
+    all_token_ids = graph_compiler.texts_to_ids(texts)
+    label_token_ids = []
+    unlabel_text_ids = []
+    label_text_ids = []
+    for i in range(len(all_token_ids)):
+        if len(all_token_ids[i]) == 0:
+            unlabel_text_ids.append(i)
+        else:
+            label_text_ids.append(i)
+            label_token_ids.append(all_token_ids[i])
+    if len(unlabel_text_ids) > 0:
+        unlabel_text_ids = torch.tensor(unlabel_text_ids)
+        unlabel_audio_ids = supervision_segments[unlabel_text_ids][:, 0].long()
+    else:
+        unlabel_audio_ids = None
 
     model.train()
     nnet_output_1, feature_1, feature_mask_1 = model(triple_feature[1].to(device), supervisions)
     if params.consistency_level == "feature":
-        feature_1 = feature_1.transpose(0,1)[feature_mask_1]
+        all_feature_1 = feature_1.transpose(0,1)[feature_mask_1]
+        # take unlabeled part of features
+        if unlabel_audio_ids != None:
+            feature_1 = feature_1.transpose(0,1)[unlabel_audio_ids][feature_mask_1[unlabel_audio_ids]]
+        else:
+            feature_1 = torch.tensor([], device=feature_1.device)
 
-    dense_fsa_vec_1 = k2.DenseFsaVec(
-        nnet_output_1,
-        supervision_segments,
-        allow_truncate=params.subsampling_factor - 1,
-    )
-    
     nnet_output_2, feature_2, feature_mask_2 = model(triple_feature[2].to(device), supervisions)
     if params.consistency_level == "feature":
-        feature_2 = feature_2.transpose(0,1)[feature_mask_2]
+        all_feature_2 = feature_2.transpose(0,1)[feature_mask_2]
+        # take unlabeled part of features
+        if unlabel_audio_ids != None:
+            feature_2 = feature_2.transpose(0,1)[unlabel_audio_ids][feature_mask_2[unlabel_audio_ids]]
+        else:
+            feature_2 = torch.tensor([], device=feature_2.device)
 
     assert feature_mask_1.equal(feature_mask_2)
 
-    dense_fsa_vec_2 = k2.DenseFsaVec(
-        nnet_output_2,
-        supervision_segments,
-        allow_truncate=params.subsampling_factor - 1,
-    )
+    # compute ctc loss for the labeled part
+    if len(label_token_ids) > 0:
+        label_text_ids = torch.tensor(label_text_ids)
+        label_supervision_segments = supervision_segments[label_text_ids]
+        decoding_graph = graph_compiler.compile(label_token_ids)
 
-    ctc_loss = 1/2 * ( k2.ctc_loss(
-        decoding_graph=decoding_graph,
-        dense_fsa_vec=dense_fsa_vec_1,
-        output_beam=params.beam_size,
-        reduction=params.reduction,
-        use_double_scores=params.use_double_scores,
-    ) + k2.ctc_loss(
-        decoding_graph=decoding_graph,
-        dense_fsa_vec=dense_fsa_vec_2,
-        output_beam=params.beam_size,
-        reduction=params.reduction,
-        use_double_scores=params.use_double_scores,
-    ))
+        dense_fsa_vec_1 = k2.DenseFsaVec(
+            nnet_output_1,
+            label_supervision_segments,
+            allow_truncate=params.subsampling_factor - 1,
+        )
+        dense_fsa_vec_2 = k2.DenseFsaVec(
+            nnet_output_2,
+            label_supervision_segments,
+            allow_truncate=params.subsampling_factor - 1,
+        )
 
-    if params.quantizer:
+        ctc_loss = 1/2 * ( k2.ctc_loss(
+            decoding_graph=decoding_graph,
+            dense_fsa_vec=dense_fsa_vec_1,
+            output_beam=params.beam_size,
+            reduction=params.reduction,
+            use_double_scores=params.use_double_scores,
+        ) + k2.ctc_loss(
+            decoding_graph=decoding_graph,
+            dense_fsa_vec=dense_fsa_vec_2,
+            output_beam=params.beam_size,
+            reduction=params.reduction,
+            use_double_scores=params.use_double_scores,
+        ))
+    else:
+        # add SoftNLLLoss loss to avoid the error "not all parameters were used"
+        ctc_loss = torch.zeros((1), device=nnet_output_1.device) + 0.0 * SoftNLLLoss(nnet_output_1, nnet_output_2.exp(), feature_mask_1)
+
+        num_frames = supervision_segments[:, 2].sum().item()
+
+    if params.use_quantizer:
         mmodel = model.module if hasattr(model, "module") else model
         num_iters = 2 if random.random() < 0.5 else 1
         (reconstruction_loss, logprob_loss,
-         logits_entropy_loss, index_entropy_loss) = mmodel.quantizer.compute_loss(torch.cat((feature_1, feature_2), dim=0).detach(), num_iters)
+         logits_entropy_loss, index_entropy_loss) = mmodel.quantizer.compute_loss(torch.cat((all_feature_1, all_feature_2), dim=0).detach(), num_iters)
         quantizer_loss = (reconstruction_loss +
                     logprob_loss +
                     logits_entropy_loss * params.entropy_scale)
+
+        quantizer_loss = quantizer_loss * num_frames
     else:
         quantizer_loss = torch.zeros((1), device=nnet_output_1.device)
 
-
-    if params.consistency_weight != 0.0:
+    # compute consistency loss for the unlabeled part 
+    if params.consistency_weight != 0.0 and feature_1.size(0) > 0:
         if params.consistency_level == "logit":
-            consistency_loss = 1/2 * (SoftNLLLoss(nnet_output_1, nnet_output_2.exp(), feature_mask_1) + SoftNLLLoss(nnet_output_2, nnet_output_1.exp(), feature_mask_1))
+            consistency_loss = 1/2 * (SoftNLLLoss(nnet_output_1, nnet_output_2.exp(), feature_mask_1) + SoftNLLLoss(nnet_output_2, nnet_output_1.exp(), feature_mask_1))     
         elif params.consistency_level == "feature":
-            encoded_feature_1 = mmodel.quantizer.encode(feature_1)
-            encoded_feature_2 = mmodel.quantizer.encode(feature_2)
-            consistency_loss = 1/2 + ( mmodel.cdidxnet(
-                    feature_1, encoded_feature_2
-                ) + mmodel.cdidxnet(
-                    feature_2, encoded_feature_1
-                ))
+            # if use quantizer, compute the codebook loss
+            if params.use_quantizer:
+                encoded_feature_1 = mmodel.quantizer.encode(feature_1)
+                encoded_feature_2 = mmodel.quantizer.encode(feature_2)
+                consistency_loss = 1/2 * ( mmodel.cdidxnet(
+                        feature_1, encoded_feature_2
+                    ) + mmodel.cdidxnet(
+                        feature_2, encoded_feature_1
+                    ))
+            # if not, compute the mse loss
+            else:
+                consistency_loss = F.mse_loss(feature_1, feature_2, reduction='sum')
         else:
             raise NotImplementedError()
     else:
-        consistency_loss = torch.zeros((1), device=nnet_output_1.device)
+        # compute the codebook loss even if no unlabeled data is available in this batch
+        # to avoid the error "not all parameters were used"
+        if params.use_quantizer and params.consistency_level == "feature":
+            encoded_feature_1 = mmodel.quantizer.encode(all_feature_1)
+            encoded_feature_2 = mmodel.quantizer.encode(all_feature_2)
+            consistency_loss = 0.0 * ( mmodel.cdidxnet(
+                    all_feature_1, encoded_feature_2
+                ) + mmodel.cdidxnet(
+                    all_feature_2, encoded_feature_1
+                ))
+        else:
+            consistency_loss = torch.zeros((1), device=nnet_output_1.device)
 
     assert params.att_rate == 0.0
 
@@ -616,14 +617,15 @@ def compute_semi_loss(
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
-    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["frames"] = num_frames
     info["ctc_loss"] = ctc_loss.detach().cpu().item()
     info["consistency_loss"] = consistency_loss.detach().cpu().item()
-    info["quantizer_loss"] = quantizer_loss.detach().cpu().item()
-    info["reconstruction_loss"] = reconstruction_loss.detach().cpu().item() * info["frames"]
-    info["logprob_loss"] = logprob_loss.detach().cpu().item() * info["frames"]
-    info["logits_entropy_loss"] = logits_entropy_loss.detach().cpu().item() * info["frames"]
-    info["index_entropy_loss"] = index_entropy_loss.detach().cpu().item() * info["frames"]
+    if params.use_quantizer:
+        info["quantizer_loss"] = quantizer_loss.detach().cpu().item()
+        info["reconstruction_loss"] = reconstruction_loss.detach().cpu().item() * num_frames
+        info["logprob_loss"] = logprob_loss.detach().cpu().item() * num_frames
+        info["logits_entropy_loss"] = logits_entropy_loss.detach().cpu().item() * num_frames
+        info["index_entropy_loss"] = index_entropy_loss.detach().cpu().item() * num_frames
 
 
     info["loss"] = loss.detach().cpu().item()
@@ -922,7 +924,7 @@ def run(rank, world_size, args):
         num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
-        use_codebook_loss=True if params.quantizer else False,
+        use_codebook_loss=True if params.use_quantizer else False,
         num_codebooks=params.bytes_per_frame,
         predictor=params.predictor,
     )
@@ -930,7 +932,7 @@ def run(rank, world_size, args):
     if params.pretrained_model is not None:
         load_checkpoint(params.pretrained_model, model=model)
 
-    if params.quantizer:
+    if params.use_quantizer:
         quantizer = Quantizer(dim=params.memory_embedding_dim, num_codebooks=args.bytes_per_frame, codebook_size=256)
         if params.pretrained_quantizer is not None:
             quantizer.load_state_dict(torch.load(params.pretrained_quantizer))
@@ -947,19 +949,26 @@ def run(rank, world_size, args):
     else:
         teacher_model = None
 
-    optimizer = Noam(
-        model.parameters(),
-        model_size=params.attention_dim,
-        factor=params.lr_factor,
-        warm_step=params.warm_step,
-        weight_decay=params.weight_decay,
-    )
+    if params.optimizer_type == "noam":
+        optimizer = Noam(
+            model.parameters(),
+            model_size=params.attention_dim,
+            factor=params.lr_factor,
+            warm_step=params.warm_step,
+            weight_decay=params.weight_decay,
+        )
+    elif params.optimizer_type == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=params.lr, betas=(0.9, 0.98), eps=1e-9
+        )
+    else:
+        raise NotImplementedError()
 
     if checkpoints:
         optimizer.load_state_dict(checkpoints["optimizer"], strict=False)
 
     librispeech = LibriSpeechAsrDataModule(args)
-    train_dl = librispeech.train_dataloaders()
+    train_dl = librispeech.train_semi_dataloaders()
     valid_dl = librispeech.valid_dataloaders()
 
     scan_pessimistic_batches_for_oom(
@@ -974,7 +983,12 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs):
         train_dl.sampler.set_epoch(epoch)
 
-        cur_lr = optimizer._rate
+        if params.optimizer_type == "noam":
+            cur_lr = optimizer._rate
+        elif params.optimizer_type == "adam":
+                cur_lr = optimizer.param_groups[0]['lr']
+        else:
+            raise NotImplementedError()
         if tb_writer is not None:
             tb_writer.add_scalar(
                 "train/learning_rate", cur_lr, params.batch_idx_train
