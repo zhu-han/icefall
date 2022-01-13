@@ -511,19 +511,20 @@ def compute_semi_loss(
     model.train()
     nnet_output_1, feature_1, feature_mask_1 = model(triple_feature[1].to(device), supervisions)
     if params.consistency_level == "feature":
-        all_feature_1 = feature_1.transpose(0,1)[feature_mask_1]
+        all_feature_1 = feature_1.transpose(0,1)[~feature_mask_1]
         # take unlabeled part of features
         if unlabel_audio_ids != None:
-            feature_1 = feature_1.transpose(0,1)[unlabel_audio_ids][feature_mask_1[unlabel_audio_ids]]
+            feature_1 = feature_1.transpose(0,1)[unlabel_audio_ids][~feature_mask_1[unlabel_audio_ids]]
         else:
             feature_1 = torch.tensor([], device=feature_1.device)
 
-    nnet_output_2, feature_2, feature_mask_2 = model(triple_feature[2].to(device), supervisions)
+    mmodel = model.module if hasattr(model, "module") else model
+    nnet_output_2, feature_2, feature_mask_2 = mmodel(triple_feature[2].to(device), supervisions)
     if params.consistency_level == "feature":
-        all_feature_2 = feature_2.transpose(0,1)[feature_mask_2]
+        all_feature_2 = feature_2.transpose(0,1)[~feature_mask_2]
         # take unlabeled part of features
         if unlabel_audio_ids != None:
-            feature_2 = feature_2.transpose(0,1)[unlabel_audio_ids][feature_mask_2[unlabel_audio_ids]]
+            feature_2 = feature_2.transpose(0,1)[unlabel_audio_ids][~feature_mask_2[unlabel_audio_ids]]
         else:
             feature_2 = torch.tensor([], device=feature_2.device)
 
