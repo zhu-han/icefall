@@ -18,11 +18,12 @@
 
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
+from conformer import RelPositionMultiheadAttention, Swish, identity, RelPositionalEncoding
 
 
 class Conformer(Transformer):
@@ -49,8 +50,11 @@ class Conformer(Transformer):
         num_classes: int,
         subsampling_factor: int = 4,
         d_model: int = 256,
+        sub_d_model: int = 256,
         nhead: int = 4,
+        sub_nhead: int = 4,
         dim_feedforward: int = 2048,
+        sub_dim_feedforward: int=2048,
         num_encoder_layers: int = 12,
         num_decoder_layers: int = 6,
         dropout: float = 0.1,
@@ -75,11 +79,15 @@ class Conformer(Transformer):
         )
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
+        self.sub_encoder_pos = RelPositionalEncoding(sub_d_model, dropout)
 
         encoder_layer = ConformerEncoderLayer(
             d_model,
+            sub_d_model,
             nhead,
+            sub_nhead,
             dim_feedforward,
+            sub_dim_feedforward,
             dropout,
             cnn_module_kernel,
             normalize_before,
@@ -88,6 +96,7 @@ class Conformer(Transformer):
         self.normalize_before = normalize_before
         if self.normalize_before:
             self.after_norm = nn.LayerNorm(d_model)
+            self.sub_after_norm = nn.LayerNorm(sub_d_model)
         else:
             # Note: TorchScript detects that self.after_norm could be used inside forward()
             #       and throws an error without this change.
@@ -147,7 +156,10 @@ class Conformer(Transformer):
             Tensor: Mask tensor of dimension (batch_size, input_length)
         """
         x = self.encoder_embed(x)
-        x, pos_emb = self.encoder_pos(x)
+        if not sub:
+            x, pos_emb = self.encoder_pos(x)
+        else:
+            x, pos_emb = self.sub_encoder_pos(x)
         x = x.permute(1, 0, 2)  # (B, T, F) -> (T, B, F)
         mask = encoder_padding_mask(x.size(0), supervisions)
         if mask is not None:
@@ -155,7 +167,10 @@ class Conformer(Transformer):
         x = self.encoder(x, pos_emb, src_key_padding_mask=mask, sub=sub)  # (T, B, F)
 
         if self.normalize_before:
-            x = self.after_norm(x)
+            if not sub:
+                x = self.after_norm(x)
+            else:
+                x = self.sub_after_norm(x)
 
         return x, mask
 
@@ -183,32 +198,35 @@ class ConformerEncoderLayer(nn.Module):
     def __init__(
         self,
         d_model: int,
+        sub_d_model: int,
         nhead: int,
+        sub_nhead: int,
         dim_feedforward: int = 2048,
+        sub_dim_feedforward: int = 1024,
         dropout: float = 0.1,
         cnn_module_kernel: int = 31,
         normalize_before: bool = True,
     ) -> None:
         super(ConformerEncoderLayer, self).__init__()
-        self.self_attn = RelPositionMultiheadAttention(
-            d_model, nhead, dropout=0.0
+        self.self_attn = SubRelPositionMultiheadAttention(
+            d_model, sub_d_model, nhead, sub_nhead, dropout=0.0
         )
 
-        self.feed_forward_1 = SubLinear(d_model, dim_feedforward, d_model, d_model)
+        self.feed_forward_1 = SubLinear(d_model, dim_feedforward, sub_d_model, sub_dim_feedforward)
         self.feed_forward_2 = nn.Sequential(
             Swish(),
             nn.Dropout(dropout)
         )
-        self.feed_forward_3 = SubLinear(dim_feedforward, d_model, d_model, d_model)
+        self.feed_forward_3 = SubLinear(dim_feedforward, d_model, sub_dim_feedforward, sub_d_model)
 
-        self.feed_forward_macaron_1 = SubLinear(d_model, dim_feedforward, d_model, d_model)
+        self.feed_forward_macaron_1 = SubLinear(d_model, dim_feedforward, sub_d_model, sub_dim_feedforward)
         self.feed_forward_macaron_2 = nn.Sequential(
             Swish(),
             nn.Dropout(dropout)
         )
-        self.feed_forward_macaron_3 = SubLinear(dim_feedforward, d_model, d_model, d_model)
+        self.feed_forward_macaron_3 = SubLinear(dim_feedforward, d_model, sub_dim_feedforward, sub_d_model)
 
-        self.conv_module = ConvolutionModule(d_model, cnn_module_kernel)
+        self.conv_module = SubConvolutionModule(d_model, sub_d_model, cnn_module_kernel)
 
         self.norm_ff_macaron = nn.LayerNorm(
             d_model
@@ -221,6 +239,17 @@ class ConformerEncoderLayer(nn.Module):
         self.norm_conv = nn.LayerNorm(d_model)  # for the CNN module
         self.norm_final = nn.LayerNorm(
             d_model
+        )  # for the final output of the block
+
+        self.sub_norm_ff_macaron = nn.LayerNorm(
+            sub_d_model
+        )  # for the macaron style FNN module
+        self.sub_norm_ff = nn.LayerNorm(sub_d_model)  # for the FNN module
+        self.sub_norm_mha = nn.LayerNorm(sub_d_model)  # for the MHA module
+
+        self.sub_norm_conv = nn.LayerNorm(sub_d_model)  # for the CNN module
+        self.sub_norm_final = nn.LayerNorm(
+            sub_d_model
         )  # for the final output of the block
 
         self.dropout = nn.Dropout(dropout)
@@ -255,17 +284,26 @@ class ConformerEncoderLayer(nn.Module):
         # macaron style feed forward module
         residual = src
         if self.normalize_before:
-            src = self.norm_ff_macaron(src)
+            if not sub:
+                src = self.norm_ff_macaron(src)
+            else:
+                src = self.sub_norm_ff_macaron(src)
         src = self.feed_forward_macaron_2(self.feed_forward_macaron_1(src, sub))
         src = self.feed_forward_macaron_3(src, sub)
         src = residual + self.ff_scale * self.dropout(src)
         if not self.normalize_before:
-            src = self.norm_ff_macaron(src)
+            if not sub:
+                src = self.norm_ff_macaron(src)
+            else:
+                src = self.sub_norm_ff_macaron(src)
 
         # multi-headed self-attention module
         residual = src
         if self.normalize_before:
-            src = self.norm_mha(src)
+            if not sub:
+                src = self.norm_mha(src)
+            else:
+                src = self.sub_norm_mha(src)
         src_att = self.self_attn(
             src,
             src,
@@ -273,31 +311,50 @@ class ConformerEncoderLayer(nn.Module):
             pos_emb=pos_emb,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
+            sub=sub,
         )[0]
         src = residual + self.dropout(src_att)
         if not self.normalize_before:
-            src = self.norm_mha(src)
+            if not sub:
+                src = self.norm_mha(src)
+            else:
+                src = self.sub_norm_mha(src)
 
         # convolution module
         residual = src
         if self.normalize_before:
-            src = self.norm_conv(src)
+            if not sub:
+                src = self.norm_conv(src)
+            else:
+                src = self.sub_norm_conv(src)
         src = residual + self.dropout(self.conv_module(src))
         if not self.normalize_before:
-            src = self.norm_conv(src)
+            if not sub:
+                src = self.norm_conv(src)
+            else:
+                src = self.sub_norm_conv(src)
 
         # feed forward module
         residual = src
         if self.normalize_before:
-            src = self.norm_ff(src)
+            if not sub:
+                src = self.norm_ff(src)
+            else:
+                src = self.sub_norm_ff(src)
         src = self.feed_forward_2(self.feed_forward_1(src, sub))
         src = self.feed_forward_3(src, sub)
         src = residual + self.ff_scale * self.dropout(src)
         if not self.normalize_before:
-            src = self.norm_ff(src)
+            if not sub:
+                src = self.norm_ff(src)
+            else:
+                src = self.sub_norm_ff(src)
 
         if self.normalize_before:
-            src = self.norm_final(src)
+            if not sub:
+                src = self.norm_final(src)
+            else:
+                src = self.sub_norm_final(src)
 
         return src
 
@@ -367,138 +424,19 @@ class ConformerEncoder(nn.TransformerEncoder):
         return output
 
 
-class RelPositionalEncoding(torch.nn.Module):
-    """Relative positional encoding module.
-
-    See : Appendix B in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/embedding.py
-
-    Args:
-        d_model: Embedding dimension.
-        dropout_rate: Dropout rate.
-        max_len: Maximum input length.
-
-    """
-
-    def __init__(
-        self, d_model: int, dropout_rate: float, max_len: int = 5000
-    ) -> None:
-        """Construct an PositionalEncoding object."""
-        super(RelPositionalEncoding, self).__init__()
-        self.d_model = d_model
-        self.xscale = math.sqrt(self.d_model)
-        self.dropout = torch.nn.Dropout(p=dropout_rate)
-        self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
-
-    def extend_pe(self, x: Tensor) -> None:
-        """Reset the positional encodings."""
-        if self.pe is not None:
-            # self.pe contains both positive and negative parts
-            # the length of self.pe is 2 * input_len - 1
-            if self.pe.size(1) >= x.size(1) * 2 - 1:
-                # Note: TorchScript doesn't implement operator== for torch.Device
-                if self.pe.dtype != x.dtype or str(self.pe.device) != str(
-                    x.device
-                ):
-                    self.pe = self.pe.to(dtype=x.dtype, device=x.device)
-                return
-        # Suppose `i` means to the position of query vecotr and `j` means the
-        # position of key vector. We use position relative positions when keys
-        # are to the left (i>j) and negative relative positions otherwise (i<j).
-        pe_positive = torch.zeros(x.size(1), self.d_model)
-        pe_negative = torch.zeros(x.size(1), self.d_model)
-        position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32)
-            * -(math.log(10000.0) / self.d_model)
-        )
-        pe_positive[:, 0::2] = torch.sin(position * div_term)
-        pe_positive[:, 1::2] = torch.cos(position * div_term)
-        pe_negative[:, 0::2] = torch.sin(-1 * position * div_term)
-        pe_negative[:, 1::2] = torch.cos(-1 * position * div_term)
-
-        # Reserve the order of positive indices and concat both positive and
-        # negative indices. This is used to support the shifting trick
-        # as in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-        pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
-        pe_negative = pe_negative[1:].unsqueeze(0)
-        pe = torch.cat([pe_positive, pe_negative], dim=1)
-        self.pe = pe.to(device=x.device, dtype=x.dtype)
-
-    def forward(self, x: torch.Tensor) -> Tuple[Tensor, Tensor]:
-        """Add positional encoding.
-
-        Args:
-            x (torch.Tensor): Input tensor (batch, time, `*`).
-
-        Returns:
-            torch.Tensor: Encoded tensor (batch, time, `*`).
-            torch.Tensor: Encoded tensor (batch, 2*time-1, `*`).
-
-        """
-        self.extend_pe(x)
-        x = x * self.xscale
-        pos_emb = self.pe[
-            :,
-            self.pe.size(1) // 2
-            - x.size(1)
-            + 1 : self.pe.size(1) // 2  # noqa E203
-            + x.size(1),
-        ]
-        return self.dropout(x), self.dropout(pos_emb)
-
-
-class RelPositionMultiheadAttention(nn.Module):
-    r"""Multi-Head Attention layer with relative position encoding
-
-    See reference: "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-
-    Args:
-        embed_dim: total dimension of the model.
-        num_heads: parallel attention heads.
-        dropout: a Dropout layer on attn_output_weights. Default: 0.0.
-
-    Examples::
-
-        >>> rel_pos_multihead_attn = RelPositionMultiheadAttention(embed_dim, num_heads)
-        >>> attn_output, attn_output_weights = multihead_attn(query, key, value, pos_emb)
-    """
-
+class SubRelPositionMultiheadAttention(RelPositionMultiheadAttention):
     def __init__(
         self,
         embed_dim: int,
+        sub_embed_dim: int,
         num_heads: int,
+        sub_num_heads: int,  
         dropout: float = 0.0,
     ) -> None:
-        super(RelPositionMultiheadAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
-        assert (
-            self.head_dim * num_heads == self.embed_dim
-        ), "embed_dim must be divisible by num_heads"
-
-        self.in_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-
-        # linear transformation for positional encoding.
-        self.linear_pos = nn.Linear(embed_dim, embed_dim, bias=False)
-        # these two learnable bias are used in matrix c and matrix d
-        # as described in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context" Section 3.3
-        self.pos_bias_u = nn.Parameter(torch.Tensor(num_heads, self.head_dim))
-        self.pos_bias_v = nn.Parameter(torch.Tensor(num_heads, self.head_dim))
-
-        self._reset_parameters()
-
-    def _reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.in_proj.weight)
-        nn.init.constant_(self.in_proj.bias, 0.0)
-        nn.init.constant_(self.out_proj.bias, 0.0)
-
-        nn.init.xavier_uniform_(self.pos_bias_u)
-        nn.init.xavier_uniform_(self.pos_bias_v)
+        super(SubRelPositionMultiheadAttention, self).__init__(embed_dim, num_heads, dropout)
+        self.sub_embed_dim = sub_embed_dim
+        self.sub_num_heads = sub_num_heads
+        self.sub_head_dim = sub_embed_dim // num_heads
 
     def forward(
         self,
@@ -509,90 +447,50 @@ class RelPositionMultiheadAttention(nn.Module):
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
         attn_mask: Optional[Tensor] = None,
+        sub: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
-        r"""
-        Args:
-            query, key, value: map a query and a set of key-value pairs to an output.
-            pos_emb: Positional embedding tensor
-            key_padding_mask: if provided, specified padding elements in the key will
-                be ignored by the attention. When given a binary mask and a value is True,
-                the corresponding value on the attention layer will be ignored. When given
-                a byte mask and a value is non-zero, the corresponding value on the attention
-                layer will be ignored
-            need_weights: output attn_output_weights.
-            attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
-                the batches while a 3D mask allows to specify a different mask for the entries of each batch.
-
-        Shape:
-            - Inputs:
-            - query: :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is
-            the embedding dimension.
-            - key: :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is
-            the embedding dimension.
-            - value: :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is
-            the embedding dimension.
-            - pos_emb: :math:`(N, 2*L-1, E)` where L is the target sequence length, N is the batch size, E is
-            the embedding dimension.
-            - key_padding_mask: :math:`(N, S)` where N is the batch size, S is the source sequence length.
-            If a ByteTensor is provided, the non-zero positions will be ignored while the position
-            with the zero positions will be unchanged. If a BoolTensor is provided, the positions with the
-            value of ``True`` will be ignored while the position with the value of ``False`` will be unchanged.
-            - attn_mask: 2D mask :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
-            3D mask :math:`(N*num_heads, L, S)` where N is the batch size, L is the target sequence length,
-            S is the source sequence length. attn_mask ensure that position i is allowed to attend the unmasked
-            positions. If a ByteTensor is provided, the non-zero positions are not allowed to attend
-            while the zero positions will be unchanged. If a BoolTensor is provided, positions with ``True``
-            is not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
-            is provided, it will be added to the attention weight.
-
-            - Outputs:
-            - attn_output: :math:`(L, N, E)` where L is the target sequence length, N is the batch size,
-            E is the embedding dimension.
-            - attn_output_weights: :math:`(N, L, S)` where N is the batch size,
-            L is the target sequence length, S is the source sequence length.
-        """
-        return self.multi_head_attention_forward(
-            query,
-            key,
-            value,
-            pos_emb,
-            self.embed_dim,
-            self.num_heads,
-            self.in_proj.weight,
-            self.in_proj.bias,
-            self.dropout,
-            self.out_proj.weight,
-            self.out_proj.bias,
-            training=self.training,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            attn_mask=attn_mask,
-        )
-
-    def rel_shift(self, x: Tensor) -> Tensor:
-        """Compute relative positional encoding.
-
-        Args:
-            x: Input tensor (batch, head, time1, 2*time1-1).
-                time1 means the length of query vector.
-
-        Returns:
-            Tensor: tensor of shape (batch, head, time1, time2)
-          (note: time2 has the same value as time1, but it is for
-          the key, while time1 is for the query).
-        """
-        (batch_size, num_heads, time1, n) = x.shape
-        assert n == 2 * time1 - 1
-        # Note: TorchScript requires explicit arg for stride()
-        batch_stride = x.stride(0)
-        head_stride = x.stride(1)
-        time1_stride = x.stride(2)
-        n_stride = x.stride(3)
-        return x.as_strided(
-            (batch_size, num_heads, time1, time1),
-            (batch_stride, head_stride, time1_stride - n_stride, n_stride),
-            storage_offset=n_stride * (time1 - 1),
-        )
+        if not sub:
+            return self.multi_head_attention_forward(
+                query,
+                key,
+                value,
+                pos_emb,
+                self.embed_dim,
+                self.num_heads,
+                self.in_proj.weight,
+                self.in_proj.bias,
+                self.dropout,
+                self.out_proj.weight,
+                self.out_proj.bias,
+                self.linear_pos.weight,
+                self.pos_bias_u,
+                self.pos_bias_v,
+                training=self.training,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+            )
+        else:
+            return self.multi_head_attention_forward(
+                query,
+                key,
+                value,
+                pos_emb,
+                self.sub_embed_dim,
+                self.sub_num_heads,
+                self.in_proj.weight[:3 * self.sub_embed_dim, :self.sub_embed_dim],
+                self.in_proj.bias[:self.sub_embed_dim],
+                self.dropout,
+                self.out_proj.weight[:self.sub_embed_dim, :self.sub_embed_dim],
+                self.out_proj.bias[:self.sub_embed_dim],
+                self.linear_pos.weight[:self.sub_embed_dim, :self.sub_embed_dim],
+                self.pos_bias_u[:self.sub_num_heads, :self.sub_head_dim],
+                self.pos_bias_v[:self.sub_num_heads, :self.sub_head_dim],
+                training=self.training,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+            )
 
     def multi_head_attention_forward(
         self,
@@ -607,6 +505,9 @@ class RelPositionMultiheadAttention(nn.Module):
         dropout_p: float,
         out_proj_weight: Tensor,
         out_proj_bias: Tensor,
+        linear_pos_weight: Tensor,
+        pos_bias_u: Tensor,
+        pos_bias_v: Tensor,
         training: bool = True,
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
@@ -788,14 +689,14 @@ class RelPositionMultiheadAttention(nn.Module):
 
         pos_emb_bsz = pos_emb.size(0)
         assert pos_emb_bsz in (1, bsz)  # actually it is 1
-        p = self.linear_pos(pos_emb).view(pos_emb_bsz, -1, num_heads, head_dim)
+        p = nn.functional.linear(pos_emb, linear_pos_weight).view(pos_emb_bsz, -1, num_heads, head_dim)
         p = p.transpose(1, 2)  # (batch, head, 2*time1-1, d_k)
 
-        q_with_bias_u = (q + self.pos_bias_u).transpose(
+        q_with_bias_u = (q + pos_bias_u).transpose(
             1, 2
         )  # (batch, head, time1, d_k)
 
-        q_with_bias_v = (q + self.pos_bias_v).transpose(
+        q_with_bias_v = (q + pos_bias_v).transpose(
             1, 2
         )  # (batch, head, time1, d_k)
 
@@ -871,7 +772,7 @@ class RelPositionMultiheadAttention(nn.Module):
             return attn_output, None
 
 
-class ConvolutionModule(nn.Module):
+class SubConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model.
     Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/conformer/convolution.py
 
@@ -883,24 +784,28 @@ class ConvolutionModule(nn.Module):
     """
 
     def __init__(
-        self, channels: int, kernel_size: int, bias: bool = True
+        self, channels: int, sub_channels: int, kernel_size: int, bias: bool = True
     ) -> None:
         """Construct an ConvolutionModule object."""
-        super(ConvolutionModule, self).__init__()
+        super(SubConvolutionModule, self).__init__()
         # kernerl_size should be a odd number for 'SAME' padding
         assert (kernel_size - 1) % 2 == 0
 
-        self.pointwise_conv1 = nn.Conv1d(
+        self.pointwise_conv1 = SubConv1d(
             channels,
             2 * channels,
+            sub_channels,
+            2 * sub_channels,
             kernel_size=1,
             stride=1,
             padding=0,
             bias=bias,
         )
-        self.depthwise_conv = nn.Conv1d(
+        self.depthwise_conv = SubConv1d(
             channels,
             channels,
+            sub_channels,
+            sub_channels,
             kernel_size,
             stride=1,
             padding=(kernel_size - 1) // 2,
@@ -908,9 +813,12 @@ class ConvolutionModule(nn.Module):
             bias=bias,
         )
         self.norm = nn.BatchNorm1d(channels)
-        self.pointwise_conv2 = nn.Conv1d(
+        self.subnorm = nn.BatchNorm1d(sub_channels)
+        self.pointwise_conv2 = SubConv1d(
             channels,
             channels,
+            sub_channels,
+            sub_channels,
             kernel_size=1,
             stride=1,
             padding=0,
@@ -918,7 +826,7 @@ class ConvolutionModule(nn.Module):
         )
         self.activation = Swish()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, sub: bool) -> Tensor:
         """Compute convolution module.
 
         Args:
@@ -932,96 +840,28 @@ class ConvolutionModule(nn.Module):
         x = x.permute(1, 2, 0)  # (#batch, channels, time).
 
         # GLU mechanism
-        x = self.pointwise_conv1(x)  # (batch, 2*channels, time)
+        x = self.pointwise_conv1(x, sub)  # (batch, 2*channels, time)
         x = nn.functional.glu(x, dim=1)  # (batch, channels, time)
 
         # 1D Depthwise Conv
-        x = self.depthwise_conv(x)
-        x = self.activation(self.norm(x))
+        x = self.depthwise_conv(x, sub)
+        if sub:
+            x = self.subnorm(x)
+        else:
+            x = self.norm(x)
+        x = self.activation(x)
 
-        x = self.pointwise_conv2(x)  # (batch, channel, time)
+        x = self.pointwise_conv2(x, sub)  # (batch, channel, time)
 
         return x.permute(2, 0, 1)
 
 
-class Swish(torch.nn.Module):
-    """Construct an Swish object."""
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Return Swich activation function."""
-        return x * torch.sigmoid(x)
-
-
-def identity(x):
-    return x
-
-
-class SubLinear(nn.Module):
-    r"""Applies a linear transformation to the incoming data: :math:`y = xA^T + b`
-
-    This module supports :ref:`TensorFloat32<tf32_on_ampere>`.
-
-    Args:
-        in_features: size of each input sample
-        out_features: size of each output sample
-        bias: If set to ``False``, the layer will not learn an additive bias.
-            Default: ``True``
-
-    Shape:
-        - Input: :math:`(*, H_{in})` where :math:`*` means any number of
-          dimensions including none and :math:`H_{in} = \text{in\_features}`.
-        - Output: :math:`(*, H_{out})` where all but the last dimension
-          are the same shape as the input and :math:`H_{out} = \text{out\_features}`.
-
-    Attributes:
-        weight: the learnable weights of the module of shape
-            :math:`(\text{out\_features}, \text{in\_features})`. The values are
-            initialized from :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})`, where
-            :math:`k = \frac{1}{\text{in\_features}}`
-        bias:   the learnable bias of the module of shape :math:`(\text{out\_features})`.
-                If :attr:`bias` is ``True``, the values are initialized from
-                :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})` where
-                :math:`k = \frac{1}{\text{in\_features}}`
-
-    Examples::
-
-        >>> m = nn.Linear(20, 30)
-        >>> input = torch.randn(128, 20)
-        >>> output = m(input)
-        >>> print(output.size())
-        torch.Size([128, 30])
-    """
-    __constants__ = ['in_features', 'out_features']
-    in_features: int
-    out_features: int
-    sub_in_features: int
-    sub_out_features: int
-    weight: Tensor
-
+class SubLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, sub_in_features: int,  sub_out_features: int,  bias: bool = True,
                  device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        super(SubLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        super(SubLinear, self).__init__(in_features, out_features, bias, device, dtype)
         self.sub_in_features = sub_in_features
         self.sub_out_features = sub_out_features
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
-        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
-        # https://github.com/pytorch/pytorch/issues/57109
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input: Tensor, sub: bool) -> Tensor:
         if not sub:
@@ -1029,7 +869,32 @@ class SubLinear(nn.Module):
         else:
             return nn.functional.linear(input, self.weight[:self.sub_out_features, :self.sub_in_features], self.bias[:self.sub_out_features])
 
-    def extra_repr(self) -> str:
-        return 'in_features={}, out_features={}, bias={}'.format(
-            self.in_features, self.out_features, self.bias is not None
-        )
+from torch.nn.common_types  import _size_1_t
+
+class SubConv1d(nn.Conv1d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        sub_in_channels: int,
+        sub_out_channels: int,
+        kernel_size: _size_1_t,
+        stride: _size_1_t = 1,
+        padding: Union[str, _size_1_t] = 0,
+        dilation: _size_1_t = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = 'zeros',
+        device=None,
+        dtype=None
+    ) -> None:
+        super(SubConv1d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode, device, dtype)
+        self.sub_in_channels = sub_in_channels
+        self.sub_out_channels = sub_out_channels
+
+    def forward(self, input: Tensor, sub: bool) -> Tensor:
+        if not sub:
+            return self._conv_forward(input, self.weight, self.bias)
+        else:
+            return self._conv_forward(input, self.weight[:self.sub_out_channels, :self.sub_in_channels // self.groups], self.bias[:self.sub_out_channels])
+

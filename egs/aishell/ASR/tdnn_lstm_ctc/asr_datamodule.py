@@ -26,7 +26,6 @@ from lhotse.dataset import (
     BucketingSampler,
     CutConcatenate,
     CutMix,
-    K2SpeechRecognitionDataset,
     PrecomputedFeatures,
     SingleCutSampler,
     SpecAugment,
@@ -35,6 +34,7 @@ from lhotse.dataset.input_strategies import OnTheFlyFeatures
 from torch.utils.data import DataLoader
 
 from icefall.dataset.datamodule import DataModule
+from icefall.dataset.dataset import K2SpeechRecognitionDataset
 from icefall.utils import str2bool
 
 
