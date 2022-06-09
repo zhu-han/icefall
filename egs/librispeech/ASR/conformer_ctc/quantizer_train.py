@@ -32,6 +32,8 @@ from lhotse.dataset.collation import collate_custom_field
 from torch.utils.data import DataLoader
 import torch
 import quantization
+import logging
+from icefall.utils import setup_logger
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -49,7 +51,7 @@ def get_parser():
     parser.add_argument(
         "--memory-embedding-dim",
         type=int,
-        default=1024,
+        default=256,
         help="dim of memory embeddings to train quantizer"
     )
 
@@ -63,9 +65,9 @@ def get_parser():
     return parser
 
 def initialize_memory_dataloader(mem_dir: Path = None):
-    cuts = load_manifest(mem_dir / "memory_manifest.json")
+    cuts = load_manifest(mem_dir / "memory_manifest_1k.json")
     dataset = K2SpeechRecognitionDataset(return_cuts=True)
-    max_duration=1
+    max_duration=100
     sampler = BucketingSampler(
         cuts, max_duration=max_duration, shuffle=False,
     )
@@ -80,30 +82,29 @@ def initialize_memory_dataloader(mem_dir: Path = None):
 def main():
     parser = get_parser()
     args = parser.parse_args()
+    setup_logger(f"{args.mem_dir}/log/quantizer")
     trainer = quantization.QuantizerTrainer(dim=args.memory_embedding_dim, bytes_per_frame=args.bytes_per_frame,
                                             device=torch.device('cuda'))
     dl = initialize_memory_dataloader(args.mem_dir)
     num_cuts = 0
     done_flag = False
     epoch = 0
-    while not trainer.done():
+    while not done_flag:
+        logging.info(f"Start training for epoch {epoch}.")
         for batch in dl:
             cuts = batch["supervisions"]["cut"]
             embeddings = torch.cat([torch.from_numpy(c.load_custom("encoder_memory")) for c in cuts])
             embeddings = embeddings.to("cuda")
             num_cuts += len(cuts)
             trainer.step(embeddings)
+            # logging.info(f"Trained for {trainer.cur_iter} iter with {num_cuts} cuts on {epoch} epoch")
             if trainer.done():
                 done_flag = True
                 break
-            print(f"Trained with {num_cuts} cuts on {epoch} epoch")
-        if done_flag:
-            break
-        else:
-            epoch += 1
-            dl = initialize_memory_dataloader(args.mem_dir)
+        epoch += 1
+        dl = initialize_memory_dataloader(args.mem_dir)
     quantizer = trainer.get_quantizer()
-    quantizer_fn = quantizer.get_id() + f"-bytes_per_frame_{args.bytes_per_frame}-quantizer.pt"
+    quantizer_fn = quantizer.get_id() + f"-bytes_per_frame_{args.bytes_per_frame}_utt_1k-quantizer.pt"
     quantizer_fn = args.mem_dir / quantizer_fn
     torch.save(quantizer.state_dict(), quantizer_fn)
 

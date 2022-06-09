@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import argparse
+from enum import Flag
 import logging
 from pathlib import Path
 from typing import List, Tuple
@@ -39,6 +40,7 @@ from icefall.utils import (
     save_alignments,
     setup_logger,
 )
+import math
 
 
 def get_parser():
@@ -47,25 +49,9 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--epoch",
-        type=int,
-        default=34,
-        help="It specifies the checkpoint to use for decoding."
-        "Note: Epoch counts from 0.",
-    )
-    parser.add_argument(
-        "--avg",
-        type=int,
-        default=1,
-        help="Number of checkpoints to average. Automatically select "
-        "consecutive checkpoints before the checkpoint specified by "
-        "'--epoch'. ",
-    )
-
-    parser.add_argument(
         "--lang-dir",
         type=str,
-        default="data/lang_bpe_500",
+        default="data/lang_bpe_1000",
         help="The lang dir",
     )
 
@@ -93,7 +79,7 @@ def get_parser():
     parser.add_argument(
         "--pretrained_model",
         type=Path,
-        default=None,
+        default="conformer_ctc/exp/model.pt",
         help="use a pretrained model, e.g. a modle downloaded from model zoo",
     )
     return parser
@@ -103,8 +89,8 @@ def get_params() -> AttributeDict:
     params = AttributeDict(
         {
             "feature_dim": 80,
-            "nhead": 8,
-            "attention_dim": 512,
+            "nhead": 4,
+            "attention_dim": 256,
             "subsampling_factor": 4,
             "num_decoder_layers": 6,
             "vgg_frontend": False,
@@ -115,7 +101,6 @@ def get_params() -> AttributeDict:
         }
     )
     return params
-
 
 def compute_memory(
     model: torch.nn.Module,
@@ -143,39 +128,42 @@ def compute_memory(
         num_batches = "?"
     num_cuts = 0
 
-
     device = params.device
     cuts = []
     total_frames = 0
     done_flag = False
-    for batch_idx, batch in enumerate(dl):
-        feature = batch["inputs"]
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dl):
+            feature = batch["inputs"]
 
-        # at entry, feature is [N, T, C]
-        assert feature.ndim == 3
-        feature = feature.to(device)
+            # at entry, feature is [N, T, C]
+            assert feature.ndim == 3
+            feature = feature.to(device)
 
-        supervisions = batch["supervisions"]
+            supervisions = batch["supervisions"]
 
-        _, encoder_memory, memory_mask = model(feature, supervisions)
+            _, encoder_memory, memory_mask = model(feature, supervisions)
 
-        # [T, N, C] --> [N, T, C]
-        encoder_memory = encoder_memory.transpose(0, 1).to("cpu").numpy()
+            # [T, N, C] --> [N, T, C]
+            encoder_memory = encoder_memory.transpose(0, 1).to("cpu").numpy()
 
-        cut_list = supervisions["cut"]
-        assert len(cut_list) == encoder_memory.shape[0]
-        assert all(supervisions["start_frame"] == 0)
-        for idx, cut in enumerate(cut_list):
-            num_frames = supervisions["num_frames"][idx]
-            cut.encoder_memory = writer.store_array(
-                key=cut.id,
-                value=encoder_memory[idx][:num_frames],
-            )
-            total_frames += num_frames
+            cut_list = supervisions["cut"]
+            assert len(cut_list) == encoder_memory.shape[0]
+            assert all(supervisions["start_frame"] == 0)
+            num_cuts += len(cut_list)
+            for idx, cut in enumerate(cut_list):
+                num_frames = (~memory_mask)[idx].sum().item()
+                cut.encoder_memory = writer.store_array(
+                    key=cut.id,
+                    value=encoder_memory[idx][:num_frames],
+                )
+                total_frames += num_frames
 
-        cuts += cut_list
-        if len(cuts) > params.num_utts:
-            break
+            cuts += cut_list
+            if len(cuts) > params.num_utts:
+                break
+            if batch_idx % 100 == 0:
+                logging.info(f"processed {total_frames} frames and {num_cuts} cuts; {batch_idx} of {num_batches}")
     return CutSet.from_cuts(cuts)
 
 
@@ -200,34 +188,45 @@ def main():
     max_token_id = max(lexicon.tokens)
     num_classes = max_token_id + 1  # +1 for the blank
 
-
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
 
     params["device"] = device
 
+    logging.info("About to create model")
+    model = Conformer(
+        num_features=params.feature_dim,
+        nhead=params.nhead,
+        d_model=params.attention_dim,
+        num_classes=num_classes,
+        subsampling_factor=params.subsampling_factor,
+        num_decoder_layers=params.num_decoder_layers,
+        vgg_frontend=params.vgg_frontend,
+        use_feat_batchnorm=params.use_feat_batchnorm,
+    )
+    if params.pretrained_model is not None:
+        load_checkpoint(params.pretrained_model, model=model)
 
+    model.to(device)
+    model.eval()
+
+    args.enable_augmentation = False
     librispeech = LibriSpeechAsrDataModule(args)
 
-    test_dl = librispeech.test_dataloaders()  # a list
+    train_dl = librispeech.train_dataloaders()
 
     mem_dir = Path(params.mem_dir)
     mem_dir.mkdir(exist_ok=True)
 
-    enabled_datasets = {
-        "test_clean": test_dl[0],
-    }
-
-    with NumpyHdf5Writer(mem_dir / "memory_embeddings") as writer:
-        for name, dl in enabled_datasets.items():
-            cut_set = compute_memory(
-                model=None,
-                dl=dl,
-                params=params,
-                writer=writer,
-            )
-            cut_set.to_json(mem_dir / "memory_manifest.json")
+    with NumpyHdf5Writer(mem_dir / "memory_embeddings_1k") as writer:
+        cut_set = compute_memory(
+            model=model,
+            dl=train_dl,
+            params=params,
+            writer=writer,
+        )
+        cut_set.to_json(mem_dir / "memory_manifest_1k.json")
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)

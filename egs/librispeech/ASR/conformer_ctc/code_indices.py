@@ -55,19 +55,11 @@ def get_parser():
         help="It specifies the checkpoint to use for decoding."
         "Note: Epoch counts from 0.",
     )
-    parser.add_argument(
-        "--avg",
-        type=int,
-        default=1,
-        help="Number of checkpoints to average. Automatically select "
-        "consecutive checkpoints before the checkpoint specified by "
-        "'--epoch'. ",
-    )
 
     parser.add_argument(
         "--lang-dir",
         type=str,
-        default="data/lang_bpe_500",
+        default="data/lang_bpe_1000",
         help="The lang dir",
     )
 
@@ -88,7 +80,7 @@ def get_parser():
     parser.add_argument(
         "--quantizer_id",
         type=str,
-        default=dd94e38b,
+        default="022c7e67",
         help="quantizer_id",
     )
 
@@ -102,14 +94,14 @@ def get_parser():
     parser.add_argument(
         "--memory-embedding-dim",
         type=int,
-        default=512,
+        default=256,
         help="dim of memory embeddings to train quantizer"
     )
 
     parser.add_argument(
         "--pretrained_model",
         type=Path,
-        default=None,
+        default="conformer_ctc/exp/model.pt",
         help="use a pretrained model, e.g. a modle downloaded from model zoo",
     )
     parser.add_argument(
@@ -126,8 +118,8 @@ def get_params() -> AttributeDict:
     params = AttributeDict(
         {
             "feature_dim": 80,
-            "nhead": 8,
-            "attention_dim": 512,
+            "nhead": 4,
+            "attention_dim": 256,
             "subsampling_factor": 4,
             "num_decoder_layers": 6,
             "vgg_frontend": False,
@@ -172,43 +164,51 @@ def compute_codeindices(
     cuts = []
     total_frames = 0
     done_flag = False
-    for batch_idx, batch in enumerate(dl):
-        feature = batch["inputs"]
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dl):
+            feature = batch["inputs"]
 
-        # at entry, feature is [N, T, C]
-        assert feature.ndim == 3
-        feature = feature.to(device)
+            # at entry, feature is [N, T, C]
+            assert feature.ndim == 3
+            feature = feature.to(device)
 
-        supervisions = batch["supervisions"]
+            supervisions = batch["supervisions"]
 
-        _, encoder_memory, memory_mask = model(feature, supervisions)
-        codebook_indices = quantizer.encode(encoder_memory)
+            _, encoder_memory, memory_mask = model(feature, supervisions)
+            codebook_indices = quantizer.encode(encoder_memory)
 
-        # [T, N, C] --> [N, T, C]
-        codebook_indices = codebook_indices.transpose(0, 1).to("cpu").numpy().astype(np.int16)
+            # [T, N, C] --> [N, T, C]
+            codebook_indices = codebook_indices.transpose(0, 1).to("cpu").numpy().astype(np.int16)
 
-        # for idx, cut in enumerate(cut_ids):
-        cut_list = supervisions["cut"]
-        assert len(cut_list) == codebook_indices.shape[0]
-        num_cuts += len(cut_list)
-        assert all(supervisions["start_frame"] == 0)
-        for idx, cut in enumerate(cut_list):
-            num_frames = (((supervisions["num_frames"][idx] - 3) // 2 + 1) - 3)// 2 + 1
-            cut.codebook_indices = writer.store_array(
-                key=cut.id,
-                value=codebook_indices[idx][:num_frames],
-                frame_shift=0.04,
-                temporal_dim=0,
-                start=0,
-            )
-            total_frames += num_frames
-
-
-        cuts += cut_list
-        print(f"processed {total_frames} frames and {num_cuts} cuts; {batch_idx} of {num_batches}")
-        # if total_frames > 1000:
-        #     break
+            # for idx, cut in enumerate(cut_ids):
+            cut_list = supervisions["cut"]
+            assert len(cut_list) == codebook_indices.shape[0]
+            num_cuts += len(cut_list)
+            assert all(supervisions["start_frame"] == 0)
+            for idx, cut in enumerate(cut_list):
+                num_frames = (~memory_mask)[idx].sum().item()
+                cut.codebook_indices = writer.store_array(
+                    key=cut.id,
+                    value=codebook_indices[idx][:num_frames],
+                    frame_shift=0.04,
+                    temporal_dim=0,
+                    start=0,
+                )
+                total_frames += num_frames
+            cuts += cut_list
+            if batch_idx % 200 == 0:
+                logging.info(f"processed {total_frames} frames and {num_cuts} cuts; {batch_idx} of {num_batches}")
     return CutSet.from_cuts(cuts)
+
+
+def get_dataloader(args, key):
+    librispeech = LibriSpeechAsrDataModule(args)
+    if key == "train":
+        dl = librispeech.train_dataloaders()
+    else:
+        dl = librispeech.partition_dataloaders(key)
+    return dl
+
 
 
 @torch.no_grad()
@@ -220,7 +220,6 @@ def main():
     assert args.return_cuts is True
     assert args.concatenate_cuts is False
     assert args.quantizer_id is not None
-    assert args.model_id is not None
 
     params = get_params()
     params.update(vars(args))
@@ -234,6 +233,17 @@ def main():
     max_token_id = max(lexicon.tokens)
     num_classes = max_token_id + 1  # +1 for the blank
 
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", 0)
+
+    params["device"] = device
+
+    quantizer_fn = f"{params.exp_dir}/mem/{params.quantizer_id}-bytes_per_frame_{params.bytes_per_frame}_utt_1k-quantizer.pt"
+
+    quantizer = Quantizer(dim=params.memory_embedding_dim, num_codebooks=args.bytes_per_frame, codebook_size=256)
+    quantizer.load_state_dict(torch.load(quantizer_fn))
+    quantizer = quantizer.to(device)
 
     logging.info("About to create model")
     model = Conformer(
@@ -246,50 +256,31 @@ def main():
         vgg_frontend=params.vgg_frontend,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
-
-    quantizer_fn = f"{params.quantizer_id}-bytes_per_frame_{params.bytes_per_frame}-quantizer.pt"
-
-    quantizer = Quantizer(dim=params.memory_embedding_dim, num_codebooks=args.bytes_per_frame, codebook_size=256)
-    quantizer.load_state_dict(torch.load(quantizer_fn))
-    quantizer = quantizer.to("cuda")
-
     if params.pretrained_model is not None:
-        load_checkpoint(f"{params.pretrained_model}", model)
-    elif params.avg == 1:
-        load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
-    else:
-        start = params.epoch - params.avg + 1
-        filenames = []
-        for i in range(start, params.epoch + 1):
-            if start >= 0:
-                filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
-        logging.info(f"averaging {filenames}")
-        model.load_state_dict(average_checkpoints(filenames))
-
-    device = torch.device("cpu")
-    if torch.cuda.is_available():
-        device = torch.device("cuda", 0)
-
-    params["device"] = device
+        load_checkpoint(params.pretrained_model, model=model)
 
     model.to(device)
     model.eval()
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    args.enable_augmentation = False
 
-    train_dl = librispeech.train_dataloaders(no_aug=True)
-
-    cdidx_dir = Path(params.data_dir) / f"{args.model_id}-{quantizer_id}-bytes_per_frame-{args.bytes_per_frame}"
+    cdidx_dir = Path(params.data_dir) / f"{params.quantizer_id}-bytes_per_frame-{args.bytes_per_frame}"
     cdidx_dir.mkdir(exist_ok=True)
 
-    with NumpyHdf5Writer(cdidx_dir / "cdidx_train-clean-100") as writer:
-        cut_set = compute_codeindices(
-            model=model,
-            dl=train_dl,
-            quantizer=quantizer,
-            params=params,
-            writer=writer,
-        cut_set.to_json(cdidx_dir / "cuts_train-clean-100.json")
+    keys = ["dev-clean", "dev-other", "test-clean", "test-other", "train-clean-100", "train-clean-360", "train-other-500"]
+
+    for key in keys:
+        dl = get_dataloader(args, key)
+
+        with NumpyHdf5Writer(cdidx_dir / f"cdidx_{key}") as writer:
+            cut_set = compute_codeindices(
+                model=model,
+                dl=dl,
+                quantizer=quantizer,
+                params=params,
+                writer=writer
+            )
+        cut_set.to_json(cdidx_dir / f"cuts_{key}.json.gz")
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
