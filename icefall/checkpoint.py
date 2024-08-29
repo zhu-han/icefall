@@ -46,6 +46,7 @@ def save_checkpoint(
     scaler: Optional[GradScaler] = None,
     sampler: Optional[CutSampler] = None,
     rank: int = 0,
+    exclude_frozen_parameters: bool = False,
 ) -> None:
     """Save training information to a file.
 
@@ -66,6 +67,8 @@ def save_checkpoint(
         The GradScaler to be saved. We only save its `state_dict()`.
       rank:
         Used in DDP. We save checkpoint only for the node whose rank is 0.
+      exclude_frozen_parameters:
+        Exclude frozen parameters from checkpointed model state.
     Returns:
       Return None.
     """
@@ -76,9 +79,15 @@ def save_checkpoint(
 
     if isinstance(model, DDP):
         model = model.module
+      
+    model_state_dict = model.state_dict()
+    if exclude_frozen_parameters:
+        for n, p in model.named_parameters():
+            if not p.requires_grad and n in model_state_dict:
+                del model_state_dict[n]
 
     checkpoint = {
-        "model": model.state_dict(),
+        "model": model_state_dict,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "grad_scaler": scaler.state_dict() if scaler is not None else None,

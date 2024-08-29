@@ -1518,6 +1518,9 @@ def get_parameter_groups_with_lrs(
         split_name = name.split(".")
         # caution: as a special case, if the name is '', split_name will be [ '' ].
         prefix = split_name[0]
+        if not parameter.requires_grad:
+            logging.info(f"Remove {name} from parameter")
+            continue
         if prefix == "module":  # DDP
             module_name = split_name[1]
             if module_name in freeze_modules:

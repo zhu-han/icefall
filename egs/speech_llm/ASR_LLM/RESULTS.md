@@ -1,6 +1,22 @@
 ## Results
 
-### whisper_llm_zh finetuning results
+### zipformer_llm_en results
+
+|Model|         Training Dataset  | Speech Encoder | LLM |  Projector |
+|-| -------------------------| ----------------|------|---------------|
+|[Zipformer + LLM](https://huggingface.co/zhu-han/icefall_asr_librispeech_zipformer_qwen2_1.5B)  | LibriSpeech  | Zipformer Large Transducer/CR-CTC, freeze| Qwen2-1.5B-Instruct, LoRA | Linear, 4x downsample|
+|[Zipformer MoSE + LLM](https://huggingface.co/zhu-han/icefall_asr_librispeech_zipformer_mose_qwen2_1.5B)  | LibriSpeech  | Mixture-of-Speech-Encoders (4 Zipformer Large models), freeze| Qwen2-1.5B-Instruct, LoRA | Linear, 4x downsample|
+
+
+WER Details:
+
+| Model | LibriSpeech test-clean | LibriSpeech test-other | 
+|-------|---------------------|-----------|
+|[Zipformer + LLM](https://huggingface.co/zhu-han/icefall_asr_librispeech_zipformer_qwen2_1.5B) | 1.84 | 3.83 |
+|[Zipformer MoSE + LLM](https://huggingface.co/zhu-han/icefall_asr_librispeech_zipformer_mose_qwen2_1.5B) | 1.74 | 3.53 |
+
+
+### whisper_llm_zh results
 
 |Model|         Training Dataset  | Speech Encoder | LLM |  Projector |
 |-| -------------------------| ----------------|------|---------------|
@@ -28,71 +44,3 @@ CER Details:
 | WenetSpeech test_meeting | - | 6.41 | 6.06 |
 | WenetSpeech tes_net | - | 6.63 | 6.30 |
 | SPEECHIO Avg 001-026 | - | 4.80 | 4.50 |
-
-
-Command for training is:
-```bash
-pip install -r whisper_llm_zh/requirements.txt
-
-pip install huggingface_hub['cli']
-mkdir -p models/whisper models/qwen
-
-# For aishell fine-tuned whisper model
-huggingface-cli download --local-dir models/whisper    yuekai/icefall_asr_aishell_whisper exp_large_v2/whisper-large-v2-aishell1-epoch-10-avg-6.pt
-# For multi-hans fine-tuned whisper model
-# huggingface-cli download --local-dir models/whisper    yuekai/icefall_asr_multi-hans-zh_whisper v1.1/whisper-large-v2-multi-hans-zh-epoch-3-avg-10.pt
-
-# huggingface-clie download  --local-dir models/qwen     Qwen/Qwen2-7B-Instruct
-huggingface-clie download  --local-dir models/qwen     Qwen/Qwen2-1.5B-Instruct
-
-# First, we only train the projector and freeze other modules.
-torchrun --nproc_per_node 8 ./whisper_llm_zh/train.py \
-  --max-duration 200 \
-  --exp-dir ./whisper_llm_zh/exp_test \
-  --speech-encoder-path-or-name models/whisper/exp_large_v2/whisper-large-v2-aishell1-epoch-10-avg-6.pt \
-  --llm-path-or-name Qwen/Qwen2-1.5B-Instruct \
-  --manifest-dir data/fbank \
-  --deepspeed \
-  --deepspeed_config ./whisper_llm_zh/ds_config_zero1.json \
-  --use-flash-attn True \
-  --use-lora False --unfreeze-llm False
-
-# Then we jointly train the projector and LLM LoRA modules.
-torchrun --nproc_per_node 8 ./whisper_llm_zh/train.py \
-  --max-duration 200 \
-  --exp-dir ./whisper_llm_zh/exp_test \
-  --speech-encoder-path-or-name models/whisper/exp_large_v2/whisper-large-v2-aishell1-epoch-10-avg-6.pt \
-  --llm-path-or-name Qwen/Qwen2-1.5B-Instruct \
-  --manifest-dir data/fbank \
-  --deepspeed \
-  --deepspeed_config ./whisper_llm_zh/ds_config_zero1.json \
-  --use-flash-attn True \
-  --use-lora True --unfreeze-llm True
-  --pretrained-model-path ./whisper_llm_zh/exp_test/epoch-3.pt
-```
-
-Command for decoding using fine-tuned models:
-```bash
-mkdir -p models/whisper models/qwen models/checkpoint
-huggingface-cli download --local-dir models/checkpoint yuekai/icefall_asr_aishell_whisper_qwen2_1.5B
-
-# For aishell fine-tuned whisper model
-huggingface-cli download --local-dir models/whisper    yuekai/icefall_asr_aishell_whisper exp_large_v2/whisper-large-v2-aishell1-epoch-10-avg-6.pt
-# For multi-hans fine-tuned whisper model
-# huggingface-cli download --local-dir models/whisper    yuekai/icefall_asr_multi-hans-zh_whisper v1.1/whisper-large-v2-multi-hans-zh-epoch-3-avg-10.pt
-
-huggingface-clie download  --local-dir models/qwen     Qwen/Qwen2-7B-Instruct
-
-mkdir -p whisper_llm_zh/exp_aishell_whisper_qwen2_1.5B
-ln -s models/checkpoint/epoch-10-avg-5.pt whisper_llm_zh/exp_aishell_whisper_qwen2_1.5B/epoch-999.pt
-
-python3 ./whisper_llm_zh/decode.py \
-  --max-duration 80 \
-  --exp-dir whisper_llm_zh/exp_aishell_whisper_qwen2_1.5B \
-  --speech-encoder-path-or-name models/whisper/exp_large_v2/whisper-large-v2-aishell1-epoch-10-avg-6.pt  \
-  --llm-path-or-name models/qwen \
-  --epoch 999 --avg 1 \
-  --manifest-dir data/fbank \
-  --use-flash-attn True \
-  --use-lora True --dataset aishell
-```
