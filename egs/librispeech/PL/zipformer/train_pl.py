@@ -1079,7 +1079,6 @@ def train_one_epoch(
             set_batch_count(model, get_adjusted_batch_count(params))     
         try:
             if not labeled_batch:
-                model_ema.model.eval()
                 mmodel=model_ema.model
                 with torch.no_grad():
                     batch = decode_one_batch(mmodel, sp, batch)
@@ -1286,14 +1285,14 @@ def run(rank, world_size, args):
 
     assert params.start_epoch > 0, params.start_epoch
 
-    model_ema = EMA(model, params.ema_decay)
+    model_ema = EMA(model, params.ema_decay, ema_fp32=params.use_fp16)
 
     checkpoints = load_checkpoint_if_available(
         params=params, model=model, model_avg=model_avg, model_ema=model_ema
     )
 
     model.to(device)
-    model_ema.model.to(device)
+    model_ema.to(device)
     
     if world_size > 1:
         logging.info("Using DDP")
@@ -1556,12 +1555,11 @@ class EMA(object):
     """Exponential Moving Average of Models
     """
 
-    def __init__(self, model, ema_decay=0.999, ema_fp32=True, device=None, skip_keys=None):
+    def __init__(self, model, ema_decay=0.999, ema_fp32=False, device=None):
 
         self.decay = ema_decay
         self.model = copy.deepcopy(model)
         self.model.requires_grad_(False)
-        self.skip_keys = skip_keys or set()
         self.ema_fp32 = ema_fp32
         self.fp32_params = {}
 
@@ -1571,22 +1569,20 @@ class EMA(object):
 
         if self.ema_fp32:
             self.build_fp32_params()
+        
+        self.model.eval()
+    
+    def to(self, device):
+        self.model = self.model.to(device)
+        if self.ema_fp32:
+            for key in self.fp32_params:
+                self.fp32_params[key] = self.fp32_params[key].to(device)
 
-    def build_fp32_params(self, state_dict=None):
+    def build_fp32_params(self):
         """
         Store a copy of the EMA params in fp32.
-        If state dict is passed, the EMA params is copied from
-        the provided state dict. Otherwise, it is copied from the
-        current EMA model parameters.
         """
-        if not self.ema_fp32:
-            raise RuntimeError(
-                "build_fp32_params should not be called if ema_fp32=False. "
-                "Use ema_fp32=True if this is really intended."
-            )
-
-        if state_dict is None:
-            state_dict = self.model.state_dict()
+        state_dict = self.model.state_dict()
 
         def _to_float(t):
             return t.float() if torch.is_floating_point(t) else t
@@ -1599,33 +1595,17 @@ class EMA(object):
 
     def step(self, new_model):
         """One update of the EMA model based on new model weights"""
-        decay = self.decay
+        if isinstance(new_model, DDP):
+            new_model = new_model.module
 
         ema_state_dict = {}
         ema_params = (
             self.fp32_params if self.ema_fp32 else self.model.state_dict()
         )
         for key, param in new_model.state_dict().items():
-            if isinstance(param, dict):
-                continue
-            try:
-                ema_param = ema_params[key]
-            except KeyError:
-                ema_param = (
-                    param.float().clone() if param.ndim == 1 else copy.deepcopy(param)
-                )
-
-            if param.shape != ema_param.shape:
-                raise ValueError(
-                    "incompatible tensor shapes between model param and ema param"
-                    + "{} vs. {}".format(param.shape, ema_param.shape)
-                )
-
-            if key in self.skip_keys:
-                ema_param = param.to(dtype=ema_param.dtype).clone()
-            else:
-                ema_param.mul_(decay)
-                ema_param.add_(param.to(dtype=ema_param.dtype), alpha=1 - decay)
+            ema_param = ema_params[key]
+            ema_param.mul_(self.decay)
+            ema_param.add_(param.to(dtype=ema_param.dtype), alpha=1 - self.decay)
             ema_state_dict[key] = ema_param
         self.model.load_state_dict(ema_state_dict, strict=False)
 
