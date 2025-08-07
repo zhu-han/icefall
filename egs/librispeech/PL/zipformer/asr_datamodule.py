@@ -263,26 +263,21 @@ class LibriSpeechAsrDataModule:
         input_transforms = []
         if self.args.enable_spec_aug:
             logging.info("Enable SpecAugment")
-            logging.info(f"Time warp factor: {self.args.spec_aug_time_warp_factor}")
-            # Set the value of num_frame_masks according to Lhotse's version.
-            # In different Lhotse's versions, the default of num_frame_masks is
-            # different.
-            num_frame_masks = 10
-            num_frame_masks_parameter = inspect.signature(
-                SpecAugment.__init__
-            ).parameters["num_frame_masks"]
-            if num_frame_masks_parameter.default == 1:
-                num_frame_masks = 2
-            logging.info(f"Num frame mask: {num_frame_masks}")
-            input_transforms.append(
-                SpecAugment(
-                    time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=num_frame_masks,
-                    features_mask_size=27,
-                    num_feature_masks=2,
-                    frames_mask_size=100,
-                )
+            num_frame_masks = int(10 * self.args.time_mask_ratio)
+            max_frames_mask_fraction = 0.15 * self.args.time_mask_ratio
+            logging.info(
+                f"num_frame_masks: {num_frame_masks}, "
+                f"max_frames_mask_fraction: {max_frames_mask_fraction}"
             )
+            spec_augment = SpecAugment(
+                time_warp_factor=0,  # Do time warping in model.py
+                num_frame_masks=num_frame_masks,  # default: 10
+                features_mask_size=27,
+                num_feature_masks=2,
+                frames_mask_size=100,
+                max_frames_mask_fraction=max_frames_mask_fraction,  # default: 0.15
+            )
+            input_transforms.append(spec_augment)
         else:
             logging.info("Disable SpecAugment")
 
@@ -393,26 +388,21 @@ class LibriSpeechAsrDataModule:
         input_transforms = []
         if self.args.enable_spec_aug:
             logging.info("Enable SpecAugment")
-            logging.info(f"Time warp factor: {self.args.spec_aug_time_warp_factor}")
-            # Set the value of num_frame_masks according to Lhotse's version.
-            # In different Lhotse's versions, the default of num_frame_masks is
-            # different.
-            num_frame_masks = 10
-            num_frame_masks_parameter = inspect.signature(
-                SpecAugment.__init__
-            ).parameters["num_frame_masks"]
-            if num_frame_masks_parameter.default == 1:
-                num_frame_masks = 2
-            logging.info(f"Num frame mask: {num_frame_masks}")
-            input_transforms.append(
-                SpecAugment(
-                    time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=num_frame_masks*2,
-                    features_mask_size=27,
-                    num_feature_masks=2*2,
-                    frames_mask_size=100,
-                )
+            num_frame_masks = int(10 * self.args.time_mask_ratio)
+            max_frames_mask_fraction = 0.15 * self.args.time_mask_ratio
+            logging.info(
+                f"num_frame_masks: {num_frame_masks}, "
+                f"max_frames_mask_fraction: {max_frames_mask_fraction}"
             )
+            spec_augment = SpecAugment(
+                time_warp_factor=0,  # Do time warping in model.py
+                num_frame_masks=num_frame_masks*2,  # default: 10
+                features_mask_size=27,
+                num_feature_masks=2*2,
+                frames_mask_size=100*2,
+                max_frames_mask_fraction=max_frames_mask_fraction,  # default: 0.15
+            )
+            input_transforms.append(spec_augment)
         else:
             logging.info("Disable SpecAugment")
 
